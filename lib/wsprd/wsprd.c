@@ -1164,20 +1164,18 @@ int main(int argc, char *argv[])
     static const int bstab[14]={1,2,3,1,6,9,-162,-81,-41,-27,-15,-9,-5,-3};
     static const int bmtab[14]={0,0,0,1,0,0,0,0,0,0,0,0,0,0};
     int nbtrials=4;
-    int nhardmin,ihash;
+    int nhardmin;
     int writec2=0,maxdrift;
-    int shift1, lagmin, lagmax, lagstep, ifmin, ifmax, not_decoded;
+    int shift1, not_decoded;
     unsigned int nbits=81, stacksize=200000;
     struct snode * stack=NULL;
-    unsigned int npoints, cycles, maxnp, metric;
+    unsigned int npoints, cycles, metric;
     float df=375.0/256.0/2;
-    float fsymbs[162];
     float dt=1.0/375.0, dt_print;
     double dialfreq_cmdline=0.0, dialfreq, freq_print;
     double dialfreq_error=0.0;
     float fmin=-110, fmax=110;
-    float f1, fstep, sync1, drift1;
-    float dmin;
+    float f1, sync1, drift1;
     float psavg[512];
     float *idat, *qdat;
     clock_t t0,t00;
@@ -1778,10 +1776,8 @@ int main(int argc, char *argv[])
         ctx.maxcycles=maxcycles; ctx.nbits=nbits; ctx.stacksize=stacksize;
         ctx.minrms=minrms; ctx.hashtab=hashtab; ctx.loctab=loctab;
 
-        int idt, ii, jittered_shift;
-        float y,sq,rms;
-        int ib, blocksize, bitmetric;
-        int n1,n2,n3,nadd,nu,ntype;
+        int ii, jittered_shift;
+        int blocksize, bitmetric;
         int osd_decode;
         for (j=0; j<nwat; j++) {
             memset(symbols,0,sizeof(char)*nbits*2);
