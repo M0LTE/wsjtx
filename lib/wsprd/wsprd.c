@@ -35,6 +35,10 @@
 #include <stdint.h>
 #include <time.h>
 #include <fftw3.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include <time.h>
 #include <errno.h>
 
 #include "fano.h"
@@ -68,6 +72,15 @@ int printdata=0;
 int g_nbpct  = 0;     /* noise blanker: blank the strongest g_nbpct% of samples */
 int g_ndrop  = 1;     /* ...and this many samples after each hit                */
 int g_nbauto = 0;     /* sweep the blanker and keep whatever any setting finds  */
+int g_nthreads = 0;   /* 0 = one worker per logical processor                   */
+
+/* wall clock, because CPU-seconds stop meaning much once we thread */
+static double wsecs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    return ts.tv_sec + 1e-9*ts.tv_nsec;
+}
 
 //***************************************************************************
 unsigned long readc2file(char *ptr_to_infile, float *idat, float *qdat,
@@ -521,7 +534,7 @@ static fftwf_complex *vin=NULL,*vout=NULL;
 
 static void vensure(void)
 {
-  if(!VPLAN){
+  if(!VPLAN){   /* call once before any threads start; see main() */
     vin =(fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*VNFFT);
     vout=(fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*VNFFT);
     VPLAN=fftwf_plan_dft_1d(VNFFT,vin,vout,FFTW_FORWARD,FFTW_ESTIMATE);
@@ -652,7 +665,6 @@ void coherent_sequence_detection(float *id, float *qd, long np,
     }
 
     /* fit residual frequency and drift to those decisions */
-    vensure();
     fftwf_complex vfi[VNFFT], vfo[VNFFT];   /* per-call FFT buffers */
     {
         double bdd=0.0,bu=0.0,bval=-1.0;
@@ -874,7 +886,11 @@ void subtract_signal2(float *id, float *qd, long np,
         }
     }
 
-    // LPF
+    // LPF.  Called once per decode from the serial part of the search, and a
+    // 360-tap convolution over 45000 points is enough work to be worth sharing.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) private(j)
+#endif
     for (i=nfilt/2; i<45000-nfilt/2; i++) {
         cfi[i]=0.0; cfq[i]=0.0;
         for (j=0; j<nfilt; j++) {
@@ -961,6 +977,135 @@ unsigned int count_hard_errors( unsigned char *symbols, unsigned char *channel_s
     return nerrors;
 }
 
+
+/*****************************************************************************
+  One demodulate-and-decode attempt, made self-contained so the search grid can
+  be run in parallel.
+
+  For each candidate wsprd tries every combination of demodulator setting and
+  DT jitter offset until one decodes.  Those attempts are completely independent
+  of each other -- they only read the sample buffers -- so on a quiet frequency,
+  where every attempt fails and all of them therefore run, the grid is
+  embarrassingly parallel.  That is where nearly all of the decoder's time goes.
+
+  Results stay deterministic because the parallel loop keeps the lowest-numbered
+  attempt that succeeded, which is exactly the one the sequential search would
+  have stopped at.
+ *****************************************************************************/
+struct trial_result {
+    int decoded;
+    int blocksize, bitmetric, jitter, shift;
+    unsigned int metric, cycles;
+    int nhardmin, osd_decode;
+    float dmin;
+    unsigned char decdata[11];
+    unsigned char symbols[162];
+};
+
+struct dec_ctx {
+    float *idat, *qdat;
+    long  npoints;
+    int   (*mettab)[256];
+    int   delta, ndepth, symfac, stackdecoder;
+    unsigned int maxcycles, nbits, stacksize;
+    float minrms;
+    const char *hashtab, *loctab;
+};
+
+static void run_trial(const struct dec_ctx *c, float f1, int shift1, float drift1,
+                      int blocksize, int bitmetric, int jitter,
+                      struct snode *stack, struct trial_result *out)
+{
+    unsigned char symbols[162*2], decdata[11], cw[162], apmask[162];
+    signed char message[11];
+    char callsign[13], grid[5];
+    float fsymbs[162], dmin=0.0;
+    unsigned int metric=0, cycles=0, maxnp=0;
+    int nhardmin=0, i, not_decoded=1, osd_decode=0;
+    int jittered_shift=shift1+jitter;
+
+    memset(out,0,sizeof *out);
+    out->blocksize=blocksize; out->bitmetric=bitmetric;
+    out->jitter=jitter; out->shift=jittered_shift;
+    memset(symbols,0,sizeof symbols);
+    memset(apmask,0,sizeof apmask);
+
+    if( blocksize < 0 ) {
+        coherent_sequence_detection(c->idat, c->qdat, c->npoints, symbols, &f1,
+                                    &jittered_shift, &drift1, c->symfac, -blocksize);
+    } else {
+        noncoherent_sequence_detection(c->idat, c->qdat, c->npoints, symbols, &f1,
+                                       &jittered_shift, &drift1, c->symfac,
+                                       &blocksize, &bitmetric);
+    }
+
+    float sq=0.0;
+    for(i=0; i<162; i++){ float y=(float)symbols[i]-128.0f; sq += y*y; }
+    if( sqrtf(sq/162.0f) <= c->minrms ) return;
+
+    deinterleave(symbols);
+
+    if( c->stackdecoder ) {
+        not_decoded = jelinek(&metric,&cycles,decdata,symbols,c->nbits,
+                              c->stacksize,stack,c->mettab,c->maxcycles);
+    } else {
+        not_decoded = fano(&metric,&cycles,&maxnp,decdata,symbols,c->nbits,
+                           c->mettab,c->delta,c->maxcycles);
+    }
+
+    if( (c->ndepth >= 0) && not_decoded ) {
+        for(i=0; i<162; i++) fsymbs[i]=symbols[i]-128.0f;
+        int nd=c->ndepth;
+        osdwspr_(fsymbs,apmask,&nd,cw,&nhardmin,&dmin);
+
+        unsigned char osdsym[162*2];
+        memcpy(osdsym,symbols,sizeof osdsym);
+        for(i=0; i<162; i++) osdsym[i]=255*cw[i];
+        fano(&metric,&cycles,&maxnp,decdata,osdsym,c->nbits,
+             c->mettab,c->delta,c->maxcycles);
+        for(i=0; i<11; i++)
+            message[i] = decdata[i]>127 ? (signed char)(decdata[i]-256)
+                                        : (signed char)decdata[i];
+        int n1,n2,n3,nadd,nu,ntype,itype,ihash;
+        unpack50(message,&n1,&n2);
+        /* An implausible OSD result means this attempt failed.  Stock wsprd
+           breaks out of the whole jitter loop here, which silently abandons
+           the remaining DT offsets for this demodulator setting. */
+        if( !unpackcall(n1,callsign) ) return;
+        callsign[12]=0;
+        if( !unpackgrid(n2, grid) ) return;
+        grid[4]=0;
+        ntype = (n2&127) - 64;
+        if( (ntype >= 0) && (ntype <= 62) ) {
+            nu = ntype%10;
+            itype=1;
+            if( !(nu == 0 || nu == 3 || nu == 7) ) {
+                nadd=nu;
+                if( nu > 3 ) nadd=nu-3;
+                if( nu > 7 ) nadd=nu-7;
+                n3=n2/128+32768*(nadd-1);
+                if( !unpackpfx(n3,callsign) ) return;
+                itype=2;
+            }
+            ihash=nhash(callsign,strlen(callsign),(uint32_t)146);
+            if(strncmp(c->hashtab+ihash*13,callsign,13)==0) {
+                if( (itype==1 && strncmp(c->loctab+ihash*5,grid,5)==0) ||
+                    (itype==2) ) {
+                   not_decoded=0;
+                   osd_decode =1;
+                }
+            }
+        }
+    }
+
+    if( not_decoded ) return;
+    out->decoded=1;
+    out->metric=metric; out->cycles=cycles;
+    out->nhardmin=nhardmin; out->dmin=dmin; out->osd_decode=osd_decode;
+    memcpy(out->decdata,decdata,11);
+    memcpy(out->symbols,symbols,162);
+}
+
 //***************************************************************************
 void usage(void)
 {
@@ -984,6 +1129,7 @@ void usage(void)
     printf("            6 adds noncoherent block lengths 6 and 9,\n");
     printf("            7..14 add coherent demodulation, smoothing 162,81,41,27,15,9,5,3\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
+    printf("       -P n worker threads: 0 = one per logical processor (default), 1 = serial\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
     printf("       -s single pass mode, no subtraction (same as original wsprd)\n");
     printf("       -v verbose mode (shows dupes)\n");
@@ -1037,6 +1183,8 @@ int main(int argc, char *argv[])
     clock_t t0,t00;
     float tfano=0.0,treadwav=0.0,tcandidates=0.0,tsync0=0.0;
     float tsync1=0.0,tsync2=0.0,tosd=0.0,ttotal=0.0;
+    float ttrials=0.0, twall=0.0;
+    double wt0, wtstart=wsecs();
     
     struct cand { float freq; float snr; int shift; float drift; float sync; };
     struct cand candidates[200];
@@ -1091,7 +1239,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:BcC:de:f:Hn:N:Jmo:qstwvz:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:BcC:de:f:Hn:N:P:Jmo:qstwvz:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1104,6 +1252,9 @@ int main(int argc, char *argv[])
                 g_nbpct=(int)strtol(optarg,NULL,10);
                 if(g_nbpct<0) g_nbpct=0;
                 if(g_nbpct>50) g_nbpct=50;
+                break;
+            case 'P':
+                g_nthreads=(int)strtol(optarg,NULL,10);
                 break;
             case 'N':
                 nbtrials=(int)strtol(optarg,NULL,10);
@@ -1174,8 +1325,18 @@ int main(int argc, char *argv[])
         ptr_to_infile=argv[optind];
     }
     
-    if( stackdecoder ) {
-        stack=calloc(stacksize,sizeof(struct snode));
+#ifdef _OPENMP
+    if( g_nthreads > 0 ) omp_set_num_threads(g_nthreads);
+    int nworkers = omp_get_max_threads();
+#else
+    int nworkers = 1;
+#endif
+    vensure();                      /* build the FFTW plan before any threads */
+    struct snode **stacks = NULL;
+    if( stackdecoder ) {            /* the stack decoder needs one per worker */
+        stacks = calloc(nworkers,sizeof(struct snode*));
+        for(i=0;i<nworkers;i++) stacks[i]=calloc(stacksize,sizeof(struct snode));
+        stack=stacks[0];
     }
 
     // setup metric table
@@ -1314,18 +1475,24 @@ int main(int argc, char *argv[])
         }
         ndecodes_pass=0;   // still needed?
         
+        /* one independent 512-point transform per half-symbol step */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (i=0; i<nffts; i++) {
-            for(j=0; j<512; j++ ) {
-                k=i*128+j;
-                fftin[j][0]=idat[k] * w[j];
-                fftin[j][1]=qdat[k] * w[j];
+            fftwf_complex lin[512], lout[512];
+            int jj,kk;
+            for(jj=0; jj<512; jj++ ) {
+                kk=i*128+jj;
+                lin[jj][0]=idat[kk] * w[jj];
+                lin[jj][1]=qdat[kk] * w[jj];
             }
-            fftwf_execute(PLAN3);
-            for (j=0; j<512; j++ ) {
-                k=j+256;
-                if( k>511 )
-                    k=k-512;
-                ps[j][i]=fftout[k][0]*fftout[k][0]+fftout[k][1]*fftout[k][1];
+            fftwf_execute_dft(PLAN3,lin,lout);
+            for (jj=0; jj<512; jj++ ) {
+                kk=jj+256;
+                if( kk>511 )
+                    kk=kk-512;
+                ps[jj][i]=lout[kk][0]*lout[kk][0]+lout[kk][1]*lout[kk][1];
             }
         }
         
@@ -1453,10 +1620,14 @@ int main(int argc, char *argv[])
          signal vector.
          */
         
-        int idrift,ifr,if0,ifd,k0;
-        int kindex;
-        float smax,ss,pow,p0,p1,p2,p3;
+        /* Each candidate is refined into its own slot and nothing else is
+           written, so this whole search is independent per candidate. */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
         for(j=0; j<npk; j++) {                              //For each candidate...
+            int idrift,ifr,if0,ifd,k0,kindex,k;
+            float smax,ss,pow,p0,p1,p2,p3;
             smax=-1e30;
             if0=candidates[j].freq/df+256;
             for (ifr=if0-2; ifr<=if0+2; ifr++) {                      //Freq search
@@ -1512,72 +1683,74 @@ int main(int argc, char *argv[])
          NB: best possibility for OpenMP may be here: several worker threads
          could each work on one candidate at a time.
          */
+        wt0 = wsecs();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
         for (j=0; j<npk; j++) {
-            
-            f1=candidates[j].freq;
-            drift1=candidates[j].drift;
-            shift1=candidates[j].shift;
-            sync1=candidates[j].sync;
+            /* everything below is per-candidate scratch, so declare it here
+               rather than sharing the enclosing scope's variables */
+            unsigned char lsym[162*2];
+            float cf1, cdrift, csync, cfstep;
+            int cshift, cifmin, cifmax, clagmin, clagmax, clagstep;
+
+            cf1=candidates[j].freq;
+            cdrift=candidates[j].drift;
+            cshift=candidates[j].shift;
+            csync=candidates[j].sync;
             
             // coarse-grid lag and freq search, then if sync>minsync1 continue
-            fstep=0.0; ifmin=0; ifmax=0;
-            lagmin=shift1-128;
-            lagmax=shift1+128;
-            lagstep=64;
-            t0 = clock();
-            sync_and_demodulate(idat, qdat, npoints, symbols, &f1, ifmin, ifmax, fstep, &shift1,
-                                lagmin, lagmax, lagstep, &drift1, symfac, &sync1, 0);
-            tsync0 += (float)(clock()-t0)/CLOCKS_PER_SEC;
+            cfstep=0.0; cifmin=0; cifmax=0;
+            clagmin=cshift-128;
+            clagmax=cshift+128;
+            clagstep=64;
+            sync_and_demodulate(idat, qdat, npoints, lsym, &cf1, cifmin, cifmax, cfstep, &cshift,
+                                clagmin, clagmax, clagstep, &cdrift, symfac, &csync, 0);
             
-            fstep=0.25; ifmin=-2; ifmax=2;
-            t0 = clock();
-            sync_and_demodulate(idat, qdat, npoints, symbols, &f1, ifmin, ifmax, fstep, &shift1,
-                                lagmin, lagmax, lagstep, &drift1, symfac, &sync1, 1);
+            cfstep=0.25; cifmin=-2; cifmax=2;
+            sync_and_demodulate(idat, qdat, npoints, lsym, &cf1, cifmin, cifmax, cfstep, &cshift,
+                                clagmin, clagmax, clagstep, &cdrift, symfac, &csync, 1);
             
             if(ipass < 2) {
                 // refine drift estimate
-                fstep=0.0; ifmin=0; ifmax=0;
+                cfstep=0.0; cifmin=0; cifmax=0;
                 float driftp,driftm,syncp,syncm;
-                driftp=drift1+0.5;
-                sync_and_demodulate(idat, qdat, npoints, symbols, &f1, ifmin, ifmax, fstep, &shift1,
-                                    lagmin, lagmax, lagstep, &driftp, symfac, &syncp, 1);
+                driftp=cdrift+0.5;
+                sync_and_demodulate(idat, qdat, npoints, lsym, &cf1, cifmin, cifmax, cfstep, &cshift,
+                                    clagmin, clagmax, clagstep, &driftp, symfac, &syncp, 1);
                 
-                driftm=drift1-0.5;
-                sync_and_demodulate(idat, qdat, npoints, symbols, &f1, ifmin, ifmax, fstep, &shift1,
-                                    lagmin, lagmax, lagstep, &driftm, symfac, &syncm, 1);
+                driftm=cdrift-0.5;
+                sync_and_demodulate(idat, qdat, npoints, lsym, &cf1, cifmin, cifmax, cfstep, &cshift,
+                                    clagmin, clagmax, clagstep, &driftm, symfac, &syncm, 1);
                 
-                if(syncp>sync1) {
-                    drift1=driftp;
-                    sync1=syncp;
-                } else if (syncm>sync1) {
-                    drift1=driftm;
-                    sync1=syncm;
+                if(syncp>csync) {
+                    cdrift=driftp;
+                    csync=syncp;
+                } else if (syncm>csync) {
+                    cdrift=driftm;
+                    csync=syncm;
                 }
             }
-            tsync1 += (float)(clock()-t0)/CLOCKS_PER_SEC;
             
             // fine-grid lag and freq search
-            if( sync1 > minsync1 ) {
+            if( csync > minsync1 ) {
                 
-                lagmin=shift1-32; lagmax=shift1+32; lagstep=16;
-                t0 = clock();
-                sync_and_demodulate(idat, qdat, npoints, symbols, &f1, ifmin, ifmax, fstep, &shift1,
-                                    lagmin, lagmax, lagstep, &drift1, symfac, &sync1, 0);
-                tsync0 += (float)(clock()-t0)/CLOCKS_PER_SEC;
+                clagmin=cshift-32; clagmax=cshift+32; clagstep=16;
+                sync_and_demodulate(idat, qdat, npoints, lsym, &cf1, cifmin, cifmax, cfstep, &cshift,
+                                    clagmin, clagmax, clagstep, &cdrift, symfac, &csync, 0);
                 
                 // fine search over frequency
-                fstep=0.05; ifmin=-2; ifmax=2;
-                t0 = clock();
-                sync_and_demodulate(idat, qdat, npoints, symbols, &f1, ifmin, ifmax, fstep, &shift1,
-                                    lagmin, lagmax, lagstep, &drift1, symfac, &sync1, 1);
-                tsync1 += (float)(clock()-t0)/CLOCKS_PER_SEC;
+                cfstep=0.05; cifmin=-2; cifmax=2;
+                sync_and_demodulate(idat, qdat, npoints, lsym, &cf1, cifmin, cifmax, cfstep, &cshift,
+                                    clagmin, clagmax, clagstep, &cdrift, symfac, &csync, 1);
                 
-                candidates[j].freq=f1;
-                candidates[j].shift=shift1;
-                candidates[j].drift=drift1;
-                candidates[j].sync=sync1;
+                candidates[j].freq=cf1;
+                candidates[j].shift=cshift;
+                candidates[j].drift=cdrift;
+                candidates[j].sync=csync;
             }
         }
+        tsync1 += (float)(wsecs()-wt0);
         
         int nwat=0; 
         int idupe;
@@ -1598,6 +1771,13 @@ int main(int argc, char *argv[])
             }
         }
         
+        struct dec_ctx ctx;
+        ctx.idat=idat; ctx.qdat=qdat; ctx.npoints=npoints;
+        ctx.mettab=mettab; ctx.delta=delta; ctx.ndepth=ndepth;
+        ctx.symfac=symfac; ctx.stackdecoder=stackdecoder;
+        ctx.maxcycles=maxcycles; ctx.nbits=nbits; ctx.stacksize=stacksize;
+        ctx.minrms=minrms; ctx.hashtab=hashtab; ctx.loctab=loctab;
+
         int idt, ii, jittered_shift;
         float y,sq,rms;
         int ib, blocksize, bitmetric;
@@ -1614,106 +1794,61 @@ int main(int argc, char *argv[])
             not_decoded=1;
             osd_decode=0;
             
-            ib=1;
-            while( ib <= nblocksize && not_decoded ) {
-                blocksize=bstab[ib-1]; bitmetric=bmtab[ib-1];
-                
-                idt=0; ii=0;
-                while ( not_decoded && idt<=(128/iifac)) {
-                    ii=(idt+1)/2;
-                    if( idt%2 == 1 ) ii=-ii;
-                    ii=iifac*ii;
-                    jittered_shift=shift1+ii;
-                    nhardmin=0; dmin=0.0;
-                    
-                    // Get soft-decision symbols
-                    t0 = clock();
-                    if( blocksize < 0 ) {
-                        coherent_sequence_detection(idat, qdat, npoints, symbols, &f1,
-                                                    &jittered_shift, &drift1, symfac, -blocksize);
-                    } else {
-                        noncoherent_sequence_detection(idat, qdat, npoints, symbols, &f1,
-                                                       &jittered_shift, &drift1, symfac, &blocksize, &bitmetric);
-                    }
-                    tsync2 += (float)(clock()-t0)/CLOCKS_PER_SEC;
-                    
-                    sq=0.0;
-                    for(i=0; i<162; i++) {
-                        y=(float)symbols[i] - 128.0;
-                        sq += y*y;
-                    }
-                    rms=sqrt(sq/162.0);
-                    
-                    if(rms > minrms) {
-                        deinterleave(symbols);
-                        t0 = clock();
-                        
-                        if ( stack ) {
-                            not_decoded = jelinek(&metric, &cycles, decdata, symbols, nbits,
-                                                  stacksize, stack, mettab,maxcycles);
-                        } else {
-                            not_decoded = fano(&metric,&cycles,&maxnp,decdata,symbols,nbits,
-                                               mettab,delta,maxcycles);
-                        }
-                        
-                        tfano += (float)(clock()-t0)/CLOCKS_PER_SEC;
-                        
-                        if( (ndepth >= 0) && not_decoded ) {
-                            for(i=0; i<162; i++) {
-                                fsymbs[i]=symbols[i]-128.0;
-                            }
-                            t0 = clock();
-                            osdwspr_(fsymbs,apmask,&ndepth,cw,&nhardmin,&dmin);
-                            tosd += (float)(clock()-t0)/CLOCKS_PER_SEC;
-                            
-                            for(i=0; i<162; i++) {
-                                symbols[i]=255*cw[i];
-                            }
-                            fano(&metric,&cycles,&maxnp,decdata,symbols,nbits,
-                                 mettab,delta,maxcycles);
-                            for(i=0; i<11; i++) {
-                                if( decdata[i]>127 ) {
-                                    message[i]=decdata[i]-256;
-                                } else {
-                                    message[i]=decdata[i];
-                                }
-                            }
-                            unpack50(message,&n1,&n2);
-                            if( !unpackcall(n1,callsign) ) break;
-                            callsign[12]=0;
-                            if( !unpackgrid(n2, grid) ) break;
-                            grid[4]=0;
-                            ntype = (n2&127) - 64;
-                            int itype;
-                            if( (ntype >= 0) && (ntype <= 62) ) {
-                                nu = ntype%10;
-                                itype=1;
-                                if( !(nu == 0 || nu == 3 || nu == 7) ) {
-                                    nadd=nu;
-                                    if( nu > 3 ) nadd=nu-3;
-                                    if( nu > 7 ) nadd=nu-7;
-                                    n3=n2/128+32768*(nadd-1);
-                                    if( !unpackpfx(n3,callsign) ) {
-                                        break;
-                                    }
-                                    itype=2;
-                                }
-                                ihash=nhash(callsign,strlen(callsign),(uint32_t)146);
-                                if(strncmp(hashtab+ihash*13,callsign,13)==0) {
-                                    if( (itype==1 && strncmp(loctab+ihash*5,grid,5)==0) ||
-                                        (itype==2) ) {
-                                       not_decoded=0;
-                                       osd_decode =1;
-                                    } 
-                                }
-                            }
-                        }
-                        
-                    }
-                    idt++;
-                    if( quickmode ) break;
+            /* Flatten the (demodulator setting, DT jitter) grid into one list so
+               it can be run in parallel.  The attempts are independent; we keep
+               the lowest-numbered one that succeeded, which is exactly where the
+               sequential search would have stopped, so the answer does not
+               depend on how many workers ran. */
+            {
+            int nidt = quickmode ? 1 : (128/iifac + 1);
+            int ntrials = nblocksize * nidt;
+            int best_t = ntrials;
+            struct trial_result best;
+            best.decoded = 0;
+            wt0 = wsecs();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic,1)
+#endif
+            for (int t=0; t<ntrials; t++) {
+                int seen;
+#ifdef _OPENMP
+#pragma omp atomic read
+#endif
+                seen = best_t;
+                if( t > seen ) continue;      /* an earlier attempt already won */
+                int tb = t/nidt, td = t%nidt;
+                int jj = (td+1)/2;
+                if( td%2 == 1 ) jj = -jj;
+                jj = iifac*jj;
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                struct trial_result r;
+                run_trial(&ctx, candidates[j].freq, candidates[j].shift,
+                          candidates[j].drift, bstab[tb], bmtab[tb], jj,
+                          stacks ? stacks[tid] : NULL, &r);
+                if( r.decoded ) {
+#ifdef _OPENMP
+#pragma omp critical (wsprd_trialwin)
+#endif
+                    { if( t < best_t ) { best_t = t; best = r; } }
                 }
-                ib++;
+            }
+            ttrials += (float)(wsecs()-wt0);
+            if( best_t < ntrials ) {
+                not_decoded    = 0;
+                blocksize      = best.blocksize;
+                bitmetric      = best.bitmetric;
+                ii             = best.jitter;
+                jittered_shift = best.shift;
+                metric         = best.metric;
+                cycles         = best.cycles;
+                nhardmin       = best.nhardmin;
+                osd_decode     = best.osd_decode;
+                memcpy(decdata,best.decdata,11);
+                memcpy(symbols,best.symbols,162);
+            }
             }
             
             if( !not_decoded ) {
@@ -1837,6 +1972,7 @@ int main(int argc, char *argv[])
     }
     
     ttotal += (float)(clock()-t00)/CLOCKS_PER_SEC;
+    twall  += (float)(wsecs()-wtstart);
     
     fprintf(ftimer,"%7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f %7.2f\n\n",
             treadwav,tcandidates,tsync0,tsync1,tsync2,tfano,tosd,ttotal);
@@ -1851,6 +1987,9 @@ int main(int argc, char *argv[])
     fprintf(ftimer,"sync_and_demod(2)  %7.2f %7.2f\n",tsync2,tsync2/ttotal);
     fprintf(ftimer,"Stack/Fano decoder %7.2f %7.2f\n",tfano,tfano/ttotal);
     fprintf(ftimer,"OSD        decoder %7.2f %7.2f\n",tosd,tosd/ttotal);
+    fprintf(ftimer,"trial grid (wall)  %7.2f\n",ttrials);
+    fprintf(ftimer,"sync refine (wall) %7.2f\n",tsync1);
+    fprintf(ftimer,"WALL CLOCK TOTAL   %7.2f  (%d workers)\n",twall,nworkers);
     fprintf(ftimer,"-----------------------------------\n");
     fprintf(ftimer,"Total              %7.2f %7.2f\n",ttotal,1.0);
     
@@ -1881,7 +2020,7 @@ int main(int argc, char *argv[])
     free(call_loc_pow);
     free(idat);
     free(qdat);
-    free(stack);
+    if(stacks){ for(i=0;i<nworkers;i++) free(stacks[i]); free(stacks); }
     
     return 0;
 }
