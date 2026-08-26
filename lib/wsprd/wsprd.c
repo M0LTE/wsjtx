@@ -721,6 +721,8 @@ void usage(void)
     printf("       -H do not use (or update) the hash table\n");
     printf("       -J use the stack decoder instead of Fano decoder\n");
     printf("       -m decode wspr-15 .wav file\n");
+    printf("       -N n demodulator trials on the last pass (default 4 = unchanged):\n");
+    printf("            6 adds noncoherent block lengths 6 and 9\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
     printf("       -s single pass mode, no subtraction (same as original wsprd)\n");
@@ -747,6 +749,13 @@ int main(int argc, char *argv[])
     char uttime[5],date[7];
     int c,delta,maxpts=65536,verbose=0,quickmode=0,more_candidates=0, stackdecoder=0;
     int usehashtable=1,wspr_type=2, ipass, nblocksize;
+    /* Demodulator trials made on the final pass.  These are block lengths for
+       noncoherent_sequence_detection, which supports 1,2,3,6,9 -- its arrays are
+       sized 512 = 2^9 for exactly that -- but which wsprd has never asked for
+       beyond 3.  Trials run in order and the first success wins. */
+    static const int bstab[6]={1,2,3,1,6,9};
+    static const int bmtab[6]={0,0,0,1,0,0};
+    int nbtrials=4;
     int nhardmin,ihash;
     int writec2=0,maxdrift;
     int shift1, lagmin, lagmax, lagstep, ifmin, ifmax, not_decoded;
@@ -820,13 +829,18 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:BcC:de:f:HJmo:qstwvz:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:BcC:de:f:HJmN:o:qstwvz:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
                 break;
             case 'B':
                 npasses=2;
+                break;
+            case 'N':
+                nbtrials=(int)strtol(optarg,NULL,10);
+                if(nbtrials<1) nbtrials=1;
+                if(nbtrials>6) nbtrials=6;
                 break;
             case 'c':
                 writec2=1;
@@ -1011,7 +1025,7 @@ int main(int argc, char *argv[])
             minsync2=0.12;
         }
         if(ipass == 2 ) {
-            nblocksize=4;  // try 3 blocksizes plus bitbybit normalization
+            nblocksize=nbtrials;
             maxdrift=0;    // no drift for smaller frequency estimator variance
             minsync2=0.10;
         }
@@ -1319,8 +1333,7 @@ int main(int argc, char *argv[])
             
             ib=1;
             while( ib <= nblocksize && not_decoded ) {
-                if (ib < 4) { blocksize=ib; bitmetric=0; }
-                if (ib == 4) { blocksize=1; bitmetric=1; }
+                blocksize=bstab[ib-1]; bitmetric=bmtab[ib-1];
                 
                 idt=0; ii=0;
                 while ( not_decoded && idt<=(128/iifac)) {
