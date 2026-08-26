@@ -122,6 +122,181 @@ unsigned long readc2file(char *ptr_to_infile, float *idat, float *qdat,
     }
 }
 
+/* -------------------------------------------------------------------------
+   Frequency-domain interference excision.
+
+   readwavfile() already takes one big forward FFT of the whole recording, so
+   the 375 Hz slice it keeps around 1500 Hz is sitting in memory as 46080 bins
+   of 0.00814 Hz each.  That is the natural place to deal with a narrowband
+   intruder: a CW carrier, a birdie, a switching-supply spur.
+
+   Two facts make it work at that resolution:
+
+     - a carrier is two bins wide, and 60..80 dB above the per-bin noise floor
+     - a WSPR transmission is not narrowband here at all.  Its 162 symbols are
+       0.68 s each, so every symbol is 1.5 Hz wide, and the four tones smear
+       into a 6 Hz plateau roughly 740 bins across.  No single bin of it ever
+       stands far above its own neighbours.
+
+   So the test is not "is this bin big" -- a loud WSPR signal is also big -- but
+   "is this bin big COMPARED WITH the 0.4 to 2.3 Hz either side of it".  That
+   ratio is ~55 dB for a carrier and ~15 dB for a WSPR signal however strong the
+   WSPR signal is, because the comparison band is inside its own plateau.
+
+   Having found a spur, the notch has to be grown outwards, because a 114 s
+   rectangular record gives a carrier a 1/df^2 leakage skirt that is genuinely
+   present in the DFT coefficients and that runs many Hz either side.  Zeroing
+   only the peak leaves most of the interference behind.  Growth stops where the
+   smoothed spectrum falls back to the local floor, which makes the notch width
+   set itself from the carrier strength instead of from a constant.
+
+   What is left after a hard notch of width B is not a weak carrier spread over
+   the record; it is the turn-on and turn-off transient of the record edges,
+   about 1/B seconds long at each end.  That is why a notch a couple of Hz wide
+   is worth far more than its energy fraction suggests.
+
+   The local floor is the MINIMUM of the 256-bin block medians within +-4
+   blocks, not the median of them.  A floor that followed the leakage skirt
+   would stop the notch growing out of the skirt that produced it.
+   ------------------------------------------------------------------------- */
+
+int   g_fex      = 1;       /* on by default; -X 0 restores the old path    */
+int   g_fexauto  = 0;       /* sweep the aggressiveness, keep every decode  */
+float g_fexT1    = 1000.0f; /* peak / local floor, to be a spur at all      */
+float g_fexT2    = 300.0f;  /* peak / max(side medians), the narrowness test*/
+float g_fexT3    = 2.0f;    /* smoothed / floor, where notch growth stops   */
+int   g_fexW     = 2048;    /* hard cap on notch half width, in bins        */
+int   g_fexclamp = 0;       /* 1 = clamp to the floor, 0 = zero the bins    */
+long  g_fexbins  = 0;       /* diagnostics for the last readwavfile()       */
+int   g_fexhits  = 0;
+float g_fexf[16];           /* frequencies of the spurs found, Hz re 1500   */
+
+#define FEX_BS   256        /* floor block, 2.08 Hz                         */
+#define FEX_MB   4          /* floor = min of block medians over +-MB       */
+#define FEX_SM   33         /* boxcar width for the growth test             */
+#define FEX_G1   48         /* narrowness test window, inner edge (0.39 Hz) */
+#define FEX_G2   288        /* ... and outer edge (2.34 Hz)                 */
+#define FEX_ITER 64         /* give up after this many spurs.  A keyed CW
+                               signal is a comb of lines at the keying rate,
+                               not one line, so the budget has to be generous */
+
+static int fexcmp(const void *a, const void *b)
+{
+    float x=*(const float*)a, y=*(const float*)b;
+    return (x<y) ? -1 : (x>y);
+}
+static inline int fexwrap(int i, int n){ i%=n; return (i<0)? i+n : i; }
+
+static float fexmed(const float *p, int n, int lo, int len, float *scratch)
+{
+    for(int i=0;i<len;i++) scratch[i]=p[fexwrap(lo+i,n)];
+    qsort(scratch,len,sizeof(float),fexcmp);
+    return scratch[len/2];
+}
+
+static void excise_spurs(fftwf_complex *X, int n, double binhz)
+{
+    if( !g_fex || n < 8*FEX_BS ) return;
+    float *P  = (float*)malloc((size_t)n*sizeof(float));
+    float *Ps = (float*)malloc((size_t)n*sizeof(float));
+    float *F  = (float*)malloc((size_t)n*sizeof(float));
+    unsigned char *mk = (unsigned char*)calloc((size_t)n,1);
+    float *sc = (float*)malloc((size_t)(FEX_G2+FEX_BS+8)*sizeof(float));
+    int nb = n/FEX_BS;
+    float *bm = (float*)malloc((size_t)nb*sizeof(float));
+    g_fexbins=0; g_fexhits=0;
+    if( !P || !Ps || !F || !mk || !sc || !bm ) goto done;
+
+    for(int i=0;i<n;i++) P[i]=X[i][0]*X[i][0]+X[i][1]*X[i][1];
+
+    for(int b=0;b<nb;b++) bm[b]=fexmed(P,n,b*FEX_BS,FEX_BS,sc);
+    for(int b=0;b<nb;b++){
+        float m=1e30f;
+        for(int d=-FEX_MB;d<=FEX_MB;d++){
+            float v=bm[fexwrap(b+d,nb)];
+            if(v<m) m=v;
+        }
+        m /= 0.6931f;                 /* median of an exponential -> its mean */
+        if(m<=0.0f) m=1e-30f;
+        for(int i=0;i<FEX_BS;i++) F[b*FEX_BS+i]=m;
+    }
+
+    {   double s=0.0;
+        for(int d=-(FEX_SM/2); d<=FEX_SM/2; d++) s+=P[fexwrap(d,n)];
+        for(int i=0;i<n;i++){
+            Ps[i]=(float)(s/FEX_SM);
+            s += P[fexwrap(i+1+FEX_SM/2,n)] - P[fexwrap(i-FEX_SM/2,n)];
+        }
+    }
+
+    for(int it=0; it<FEX_ITER; it++){
+        int best=-1; float bestr=0.0f;
+        for(int i=0;i<n;i++){
+            if(mk[i]) continue;
+            float r=P[i]/F[i];
+            if(r>bestr){ bestr=r; best=i; }
+        }
+        if( best<0 || bestr < g_fexT1 ) break;
+
+        float L=fexmed(P,n,best-FEX_G2,FEX_G2-FEX_G1,sc);
+        float R=fexmed(P,n,best+FEX_G1,FEX_G2-FEX_G1,sc);
+        float N=(L>R)?L:R;
+        if(N < F[best]) N=F[best];
+        if( getenv("WSPRD_FEX_DEBUG") )
+            fprintf(stderr,"fex:   cand %+8.3f Hz  P/F=%10.3g  P/N=%10.3g  %s\n",
+                    (best<=n/2? best : best-n)*binhz, bestr, P[best]/N,
+                    (P[best] >= g_fexT2*N)?"EXCISE":"broad, left alone");
+        if( P[best] < g_fexT2*N ){
+            /* Broad.  A WSPR signal, or an interferer wide enough that there is
+               nothing to excise.  Retire the neighbourhood and look elsewhere. */
+            for(int d=-FEX_G2; d<=FEX_G2; d++) mk[fexwrap(best+d,n)] |= 2;
+            continue;
+        }
+
+        int wlo=0, whi=0;
+        while(wlo<g_fexW){ int j=fexwrap(best-wlo-1,n); if(Ps[j] > g_fexT3*F[j]) wlo++; else break; }
+        while(whi<g_fexW){ int j=fexwrap(best+whi+1,n); if(Ps[j] > g_fexT3*F[j]) whi++; else break; }
+        for(int d=-wlo; d<=whi; d++){
+            int j=fexwrap(best+d,n);
+            if(!(mk[j]&1)){ mk[j]|=1; g_fexbins++; }
+            mk[j]|=2;
+        }
+        if(g_fexhits<16) g_fexf[g_fexhits]=(float)((best<=n/2? best : best-n)*binhz);
+        g_fexhits++;
+    }
+
+    for(int i=0;i<n;i++){
+        if( !(mk[i]&1) ) continue;
+        if( g_fexclamp ){
+            if(P[i]>F[i]){ float g=sqrtf(F[i]/P[i]); X[i][0]*=g; X[i][1]*=g; }
+        } else {
+            X[i][0]=0.0f; X[i][1]=0.0f;
+        }
+    }
+
+    if( getenv("WSPRD_FEX_DEBUG") ){
+        fprintf(stderr,"fex: T1=%.0f T2=%.0f T3=%.2f W=%d clamp=%d  spurs=%d bins=%ld (%.2f%%)",
+                g_fexT1,g_fexT2,g_fexT3,g_fexW,g_fexclamp,g_fexhits,g_fexbins,100.0*g_fexbins/n);
+        for(int i=0;i<g_fexhits && i<16;i++) fprintf(stderr," %+.2fHz",g_fexf[i]);
+        fprintf(stderr,"\n");
+    }
+done:
+    free(P); free(Ps); free(F); free(mk); free(sc); free(bm);
+}
+
+/* Aggressiveness presets.  Index 0 is off, so a sweep that starts at 0 can only
+   ever add decodes to what the unexcised decoder already found. */
+static void fex_preset(int k)
+{
+    switch(k){
+      case 0: g_fex=0; break;
+      case 1: g_fex=1; g_fexT1=1000.0f; g_fexT2=300.0f; g_fexT3=2.0f; g_fexW=2048; break;
+      case 2: g_fex=1; g_fexT1= 200.0f; g_fexT2=150.0f; g_fexT3=1.6f; g_fexW=3072; break;
+      default: g_fex=0; break;
+    }
+}
+#define FEX_NPRESET 3
+
 /* Hard noise blanker, the same rule as lib/blanker.f90 which FST4 and FST4W
    already use.  Find the amplitude exceeded by npct/ndropmax of the samples,
    zero those and the ndropmax samples that follow. */
@@ -220,6 +395,13 @@ unsigned long readwavfile(char *ptr_to_infile, int ntrmin, float *idat, float *q
     }
     
     fftwf_free(fftout);
+
+    /* Excise narrowband interference from the slice before it is transformed
+       back.  Everything downstream, the noise-level percentile, the candidate
+       list, and above all the totp normalisation inside sync_and_demodulate,
+       then sees a band without the intruder in it. */
+    excise_spurs(fftin, nfft2, df);
+
     fftout=(fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*nfft2);
     PLAN2 = fftwf_plan_dft_1d(nfft2, fftin, fftout, FFTW_BACKWARD, PATIENCE);
     fftwf_execute(PLAN2);
@@ -1139,6 +1321,8 @@ void usage(void)
     printf("       -N n demodulator trials on the last pass (default 4 = unchanged):\n");
     printf("            6 adds noncoherent block lengths 6 and 9,\n");
     printf("            7..14 add coherent demodulation, smoothing 162,81,41,27,15,9,5,3\n");
+    printf("       -X n narrowband interference excision: 1 = on (default), 0 = off,\n");
+    printf("            2 = aggressive, a = sweep, or T1,T2,T3,W[,c] for raw thresholds\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
     printf("       -P n worker threads: 0 = one per logical processor (default), 1 = serial\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
@@ -1248,7 +1432,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:BcC:de:f:Hn:N:P:Jmo:qstwvz:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:BcC:de:f:Hn:N:P:Jmo:qstwvX:z:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1265,6 +1449,19 @@ int main(int argc, char *argv[])
             case 'P':
                 g_nthreads=(int)strtol(optarg,NULL,10);
                 break;
+            case 'X': {
+                if(optarg[0]=='a'){ g_fexauto=1; break; }
+                float t1,t2,t3; int w=0; char cl=0;
+                int nf=sscanf(optarg,"%f,%f,%f,%d,%c",&t1,&t2,&t3,&w,&cl);
+                if(nf>=3){
+                    g_fex=1; g_fexT1=t1; g_fexT2=t2; g_fexT3=t3;
+                    g_fexW=(w>0)?w:2048; g_fexclamp=(cl=='c');
+                } else {
+                    int lev=(int)strtol(optarg,NULL,10);
+                    g_fex=lev;
+                    if(lev>=2){ g_fexT1=300.0f; g_fexT2=100.0f; }
+                }
+                break; }
             case 'N':
                 nbtrials=(int)strtol(optarg,NULL,10);
                 if(nbtrials<1) nbtrials=1;
