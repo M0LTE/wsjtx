@@ -234,9 +234,9 @@ void sync_and_demodulate(float *id, float *qd, long np,
      *           symbols using passed frequency and shift.                  *
      ************************************************************************/
     
-    static float fplast=-10000.0;
-    static float dt=1.0/375.0, df=375.0/256.0;
-    static float pi=3.14159265358979323846;
+    float fplast=-10000.0;   /* was static: shared mutable state, not thread safe */
+    static const float dt=1.0/375.0, df=375.0/256.0;
+    static const float pi=3.14159265358979323846;
     float twopidt, df15=df*1.5, df05=df*0.5;
     
     int i, j, k, lag;
@@ -381,9 +381,9 @@ void noncoherent_sequence_detection(float *id, float *qd, long np,
      *  nblock=1 corresponds to noncoherent detection of individual symbols *
      *     like the original wsprd symbol demodulator.                      *
      ************************************************************************/
-    static float fplast=-10000.0;
-    static float dt=1.0/375.0, df=375.0/256.0;
-    static float pi=3.14159265358979323846;
+    float fplast=-10000.0;   /* was static: shared mutable state, not thread safe */
+    static const float dt=1.0/375.0, df=375.0/256.0;
+    static const float pi=3.14159265358979323846;
     float twopidt, df15=df*1.5, df05=df*0.5;
     
     int i, j, k, lag, itone, ib, b, nblock, nseq, imask;
@@ -529,18 +529,22 @@ static void vensure(void)
 }
 
 static double vpeak(const double *zr,const double *zi,int i0,int L,
-                    const double *psi,double *ubest)
+                    const double *psi,double *ubest,
+                    fftwf_complex *in,fftwf_complex *out)
 {
-  for(int m=0;m<VNFFT;m++){ vin[m][0]=0.f; vin[m][1]=0.f; }
+  for(int m=0;m<VNFFT;m++){ in[m][0]=0.f; in[m][1]=0.f; }
   for(int i=0;i<L;i++){
     double c=cos(-psi[i0+i]), s=sin(-psi[i0+i]);
-    vin[i][0]=(float)(zr[i0+i]*c-zi[i0+i]*s);
-    vin[i][1]=(float)(zr[i0+i]*s+zi[i0+i]*c);
+    in[i][0]=(float)(zr[i0+i]*c-zi[i0+i]*s);
+    in[i][1]=(float)(zr[i0+i]*s+zi[i0+i]*c);
   }
-  fftwf_execute(VPLAN);
+  /* fftwf_execute() reuses the buffers the plan was built with, so it cannot be
+     called from two threads at once.  fftwf_execute_dft() runs the same plan on
+     buffers the caller supplies, which can. */
+  fftwf_execute_dft(VPLAN,in,out);
   double best=0; int mb=0;
   for(int m=0;m<VNFFT;m++){
-    double v=(double)vout[m][0]*vout[m][0]+(double)vout[m][1]*vout[m][1];
+    double v=(double)out[m][0]*out[m][0]+(double)out[m][1]*out[m][1];
     if(v>best){best=v;mb=m;}
   }
   if(ubest) *ubest = (mb<VNFFT/2? (double)mb : (double)mb-VNFFT)/VNFFT;
@@ -649,6 +653,7 @@ void coherent_sequence_detection(float *id, float *qd, long np,
 
     /* fit residual frequency and drift to those decisions */
     vensure();
+    fftwf_complex vfi[VNFFT], vfo[VNFFT];   /* per-call FFT buffers */
     {
         double bdd=0.0,bu=0.0,bval=-1.0;
         for(int stage=0;stage<2;stage++){
@@ -658,7 +663,7 @@ void coherent_sequence_detection(float *id, float *qd, long np,
                 double acc=0.0;
                 for(i=0;i<nsym;i++){ psi[i]=acc;
                     acc += 2.0*pi*tsym*dd*((double)i-(double)(nsym-1)/2.0)/(double)nsym; }
-                double u,v=vpeak(wr,wi,0,nsym,psi,&u);
+                double u,v=vpeak(wr,wi,0,nsym,psi,&u,vfi,vfo);
                 if(v>bval){ bval=v; bdd=dd; bu=u; }
             }
         }

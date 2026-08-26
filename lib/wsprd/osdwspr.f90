@@ -22,6 +22,10 @@ data gg/1,1,0,1,0,1,0,0,1,0,0,0,1,1,0,0,1,0,1,0,0,1,0,1,1,1,0,1,1,0,0,0, &
         0,1,0,0,0,0,0,0,1,0,0,1,1,1,1,0,0,0,1,0,0,1,0,0,1,0,1,1,1,1,1,1/
 
 save first,gen
+! Each worker builds its own copy of the generator matrix once.  Without this the
+! SAVEd state here and the COMMON block in boxit/fetchit are shared, and the
+! decoder cannot be threaded.
+!$omp threadprivate(first,gen)
 
 if( first ) then ! fill the generator matrix
   gen=0
@@ -290,6 +294,7 @@ subroutine boxit(reset,e2,ntau,npindex,i1,i2)
   integer   indexes(4000,2),fp(0:525000),np(4000)
   logical reset
   common/boxes/indexes,fp,np
+!$omp threadprivate(/boxes/)
 
   if(reset) then
 ! fp is indexed by an ntau-bit pattern, so only the first 2**ntau entries are
@@ -328,6 +333,7 @@ subroutine fetchit(reset,e2,ntau,i1,i2)
   logical reset
   common/boxes/indexes,fp,np
   save lastpat,inext
+!$omp threadprivate(/boxes/,lastpat,inext)
 
   if(reset) then
     lastpat=-1
