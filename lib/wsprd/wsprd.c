@@ -254,7 +254,7 @@ void sync_and_demodulate(float *id, float *qd, long np,
     
     int i, j, k, lag;
     float i0[162],q0[162],i1[162],q1[162],i2[162],q2[162],i3[162],q3[162];
-    float p0,p1,p2,p3,cmet,totp,syncmax,fac;
+    float p0,p1,p2,p3,cmet,syncmax,fac;
     float c0[256],s0[256],c1[256],s1[256],c2[256],s2[256],c3[256],s3[256];
     float dphi0, cdphi0, sdphi0, dphi1, cdphi1, sdphi1, dphi2, cdphi2, sdphi2,
     dphi3, cdphi3, sdphi3;
@@ -267,11 +267,18 @@ void sync_and_demodulate(float *id, float *qd, long np,
     if( mode == 2 ) {lagmin=*shift1;lagmax=*shift1;ifmin=0;ifmax=0;f0=*f1;}
     
     twopidt=2*pi*dt;
+    /* The tone tables below depend on the frequency, the drift and the symbol
+       index but not on the lag, so the symbol loop goes outside the lag loop and
+       each table is built once and used for every lag. */
+#define MAXLAGS 512
+    int nlags, ilag;
+    float sslag[MAXLAGS], totplag[MAXLAGS];
     for(ifreq=ifmin; ifreq<=ifmax; ifreq++) {
         f0=*f1+ifreq*fstep;
-        for(lag=lagmin; lag<=lagmax; lag=lag+lagstep) {
-            ss=0.0;
-            totp=0.0;
+        nlags=0;
+        for(lag=lagmin; lag<=lagmax && nlags<MAXLAGS; lag=lag+lagstep) nlags++;
+        for(ilag=0; ilag<nlags; ilag++){ sslag[ilag]=0.0; totplag[ilag]=0.0; }
+        {
             for (i=0; i<162; i++) {
                 fp = f0 + (*drift1/2.0)*((float)i-81.0)/81.0;
                 if( i==0 || (fp != fplast) ) {  // only calculate sin/cos if necessary
@@ -309,6 +316,7 @@ void sync_and_demodulate(float *id, float *qd, long np,
                     fplast = fp;
                 }
                 
+                for(ilag=0, lag=lagmin; ilag<nlags; ilag++, lag=lag+lagstep) {
                 i0[i]=0.0; q0[i]=0.0;
                 i1[i]=0.0; q1[i]=0.0;
                 i2[i]=0.0; q2[i]=0.0;
@@ -337,9 +345,9 @@ void sync_and_demodulate(float *id, float *qd, long np,
                 p2=sqrt(p2);
                 p3=sqrt(p3);
                 
-                totp=totp+p0+p1+p2+p3;
+                totplag[ilag]=totplag[ilag]+p0+p1+p2+p3;
                 cmet=(p1+p3)-(p0+p2);
-                ss = (pr3[i] == 1) ? ss+cmet : ss-cmet;
+                sslag[ilag] = (pr3[i] == 1) ? sslag[ilag]+cmet : sslag[ilag]-cmet;
                 if( mode == 2) {                 //Compute soft symbols
                     if(pr3[i]==1) {
                         fsymb[i]=p3-p1;
@@ -347,14 +355,17 @@ void sync_and_demodulate(float *id, float *qd, long np,
                         fsymb[i]=p2-p0;
                     }
                 }
+                } // lag loop
             }
-            ss=ss/totp;
+        }
+        for(ilag=0, lag=lagmin; ilag<nlags; ilag++, lag=lag+lagstep) {
+            ss=sslag[ilag]/totplag[ilag];
             if( ss > syncmax ) {          //Save best parameters
                 syncmax=ss;
                 best_shift=lag;
                 fbest=f0;
             }
-        } // lag loop
+        }
     } //freq loop
     
     if( mode <=1 ) {                       //Send best params back to caller
