@@ -769,6 +769,7 @@ int main(int argc, char *argv[])
     
     struct cand { float freq; float snr; int shift; float drift; float sync; };
     struct cand candidates[200];
+#define MAXUNIQUE 50
     
     struct result { char date[7]; char time[5]; float sync; float snr;
         float dt; double freq; char message[23]; float drift;
@@ -1444,7 +1445,7 @@ int main(int argc, char *argv[])
                     if(!strcmp(callsign,allcalls[i]) &&
                        (fabs(f1-allfreqs[i]) <4.0)) dupe=1;
                 }
-                if( (verbose || !dupe) && !noprint) {
+                if( (verbose || !dupe) && !noprint && uniques < MAXUNIQUE) {
                     strcpy(allcalls[uniques],callsign);
                     allfreqs[uniques]=f1;
                     uniques++;
