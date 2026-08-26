@@ -1502,6 +1502,15 @@ int main(int argc, char *argv[])
             }
         }
         
+        /* The average spectrum has been taken, and every remaining reader of
+           ps[][] wants its square root, so take it once here rather than a
+           million times inside the coarse search below. */
+        for (i=0; i<nffts; i++) {
+            for (j=0; j<512; j++) {
+                ps[j][i]=sqrtf(ps[j][i]);
+            }
+        }
+
         // Smooth with 7-point window and limit spectrum to +/-150 Hz
         int window[7]={1,1,1,1,1,1,1};
         float smspec[411];
@@ -1637,15 +1646,10 @@ int main(int argc, char *argv[])
                             ifd=ifr+((float)k-81.0)/81.0*( (float)idrift )/(2.0*df);
                             kindex=k0+2*k;
                             if( kindex >= 0 && kindex < nffts ) {
-                                p0=ps[ifd-3][kindex];
+                                p0=ps[ifd-3][kindex];   /* already square-rooted */
                                 p1=ps[ifd-1][kindex];
                                 p2=ps[ifd+1][kindex];
                                 p3=ps[ifd+3][kindex];
-                                
-                                p0=sqrt(p0);
-                                p1=sqrt(p1);
-                                p2=sqrt(p2);
-                                p3=sqrt(p3);
                                 
                                 ss=ss+(2*pr3[k]-1)*((p1+p3)-(p0+p2));
                                 pow=pow+p0+p1+p2+p3;
