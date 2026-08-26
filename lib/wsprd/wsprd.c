@@ -483,6 +483,229 @@ void noncoherent_sequence_detection(float *id, float *qd, long np,
     return;
 }
 
+
+/* Small zero-padded DFT helper used by the coherent demodulator to find the
+   residual carrier frequency left over after the noncoherent sync search. */
+#define VNFFT 2048
+static fftwf_plan VPLAN=NULL;
+static fftwf_complex *vin=NULL,*vout=NULL;
+
+static void vensure(void)
+{
+  if(!VPLAN){
+    vin =(fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*VNFFT);
+    vout=(fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*VNFFT);
+    VPLAN=fftwf_plan_dft_1d(VNFFT,vin,vout,FFTW_FORWARD,FFTW_ESTIMATE);
+  }
+}
+
+static double vpeak(const double *zr,const double *zi,int i0,int L,
+                    const double *psi,double *ubest)
+{
+  for(int m=0;m<VNFFT;m++){ vin[m][0]=0.f; vin[m][1]=0.f; }
+  for(int i=0;i<L;i++){
+    double c=cos(-psi[i0+i]), s=sin(-psi[i0+i]);
+    vin[i][0]=(float)(zr[i0+i]*c-zi[i0+i]*s);
+    vin[i][1]=(float)(zr[i0+i]*s+zi[i0+i]*c);
+  }
+  fftwf_execute(VPLAN);
+  double best=0; int mb=0;
+  for(int m=0;m<VNFFT;m++){
+    double v=(double)vout[m][0]*vout[m][0]+(double)vout[m][1]*vout[m][1];
+    if(v>best){best=v;mb=m;}
+  }
+  if(ubest) *ubest = (mb<VNFFT/2? (double)mb : (double)mb-VNFFT)/VNFFT;
+  return best;
+}
+
+/*****************************************************************************
+  Decision-directed COHERENT demodulator.
+
+  WSPR is continuous-phase 4-FSK with tone spacing exactly 1/T.  The phase a
+  symbol adds is 2*pi*f0*T + pi*(2s-3), and 2s-3 is odd for every one of the
+  four tones, so every tone advances the carrier phase by the same amount
+  modulo 2*pi.  The transmit phase at each symbol boundary is therefore
+  independent of the data, which means a coherent phase reference can be built
+  from the received signal alone -- no pilot, no known preamble.
+
+  Stock wsprd never uses this.  Its demodulator is noncoherent: it throws the
+  phase away and keeps only tone magnitudes, then optionally re-combines 2 or 3
+  neighbouring symbols coherently (nblock).  Noncoherent detection of binary
+  orthogonal signalling costs about 1 dB at high SNR and a great deal more at
+  the error rates WSPR actually runs at.
+
+  Here we:
+    1. correlate against all four tones per symbol, as usual;
+    2. rotate out the known, data-independent inter-symbol phase ramp so a
+       stable channel shows a constant phase;
+    3. take a tentative hard decision per symbol, fit the residual carrier
+       frequency and drift to those decisions (the decoder's own estimates are
+       only good to a few tenths of a hertz, which is many cycles over 110 s
+       -- noncoherent detection never cared, coherent detection does);
+    4. smooth the decision-directed complex amplitudes over nsmooth symbols to
+       track the channel, leaving each symbol out of its own estimate so it
+       cannot vote for itself;
+    5. form COHERENT soft symbols, Re{z1 conj(h)} - Re{z0 conj(h)}, which is
+       also maximal-ratio weighted across a fading channel for free.
+
+  nsmooth is the one knob: long windows win on a stable path, short ones keep
+  working when the path is fading.  Trying several is cheap.
+ *****************************************************************************/
+void coherent_sequence_detection(float *id, float *qd, long np,
+                                 unsigned char *symbols, float *f1, int *shift1,
+                                 float *drift1, int symfac, int nsmooth)
+{
+    const double dt=1.0/375.0, df=375.0/256.0;
+    const double pi=3.14159265358979323846, twopidt=2*pi*dt;
+    const double df15=df*1.5, df05=df*0.5, tsym=256.0*dt;
+    const int nsym=162;
+    int i,j,k,t;
+    float is[4][162],qs[4][162];
+    double cfs[162],sfs[162];
+    double c0[257],s0[257],c1[257],s1[257],c2[257],s2[257],c3[257],s3[257];
+    double Zr[4][162],Zi[4][162];
+    double wr[162],wi[162],psi[162];
+    double f0=*f1, drift=*drift1;
+    int lag=*shift1;
+
+    for (i=0; i<nsym; i++) {
+        double fp = f0 + (drift/2.0)*((double)i-81.0)/81.0;
+        double d0=twopidt*(fp-df15), d1=twopidt*(fp-df05);
+        double d2=twopidt*(fp+df05), d3=twopidt*(fp+df15);
+        double cd0=cos(d0),sd0=sin(d0),cd1=cos(d1),sd1=sin(d1);
+        double cd2=cos(d2),sd2=sin(d2),cd3=cos(d3),sd3=sin(d3);
+        c0[0]=1;s0[0]=0;c1[0]=1;s1[0]=0;c2[0]=1;s2[0]=0;c3[0]=1;s3[0]=0;
+        for (j=1;j<257;j++){
+            c0[j]=c0[j-1]*cd0-s0[j-1]*sd0; s0[j]=c0[j-1]*sd0+s0[j-1]*cd0;
+            c1[j]=c1[j-1]*cd1-s1[j-1]*sd1; s1[j]=c1[j-1]*sd1+s1[j-1]*cd1;
+            c2[j]=c2[j-1]*cd2-s2[j-1]*sd2; s2[j]=c2[j-1]*sd2+s2[j-1]*cd2;
+            c3[j]=c3[j-1]*cd3-s3[j-1]*sd3; s3[j]=c3[j-1]*sd3+s3[j-1]*cd3;
+        }
+        /* the per-symbol phase advance: identical for all four tones, which is
+           the whole reason this works.  Take it from tone 0. */
+        cfs[i]=c0[256]; sfs[i]=s0[256];
+        for(t=0;t<4;t++){ is[t][i]=0.0f; qs[t][i]=0.0f; }
+        for (j=0;j<256;j++){
+            k=lag+i*256+j;
+            if(k>0 && k<np){
+                float xi=id[k], xq=qd[k];
+                is[0][i]+= xi*c0[j]+xq*s0[j];  qs[0][i]+= xq*c0[j]-xi*s0[j];
+                is[1][i]+= xi*c1[j]+xq*s1[j];  qs[1][i]+= xq*c1[j]-xi*s1[j];
+                is[2][i]+= xi*c2[j]+xq*s2[j];  qs[2][i]+= xq*c2[j]-xi*s2[j];
+                is[3][i]+= xi*c3[j]+xq*s3[j];  qs[3][i]+= xq*c3[j]-xi*s3[j];
+            }
+        }
+    }
+
+    /* rotate out the cumulative inter-symbol phase ramp */
+    double pr=1.0, pq=0.0;
+    for (i=0;i<nsym;i++){
+        for(t=0;t<4;t++){
+            Zr[t][i]= is[t][i]*pr + qs[t][i]*pq;
+            Zi[t][i]= qs[t][i]*pr - is[t][i]*pq;
+        }
+        double a=pr*cfs[i]-pq*sfs[i], b=pr*sfs[i]+pq*cfs[i];
+        double m=sqrt(a*a+b*b); if(m>0){a/=m;b/=m;}
+        pr=a; pq=b;
+    }
+
+    /* tentative decisions -> decision-directed complex amplitudes */
+    for (i=0;i<nsym;i++){
+        int t0=pr3[i], t1=pr3[i]+2;
+        double p0=Zr[t0][i]*Zr[t0][i]+Zi[t0][i]*Zi[t0][i];
+        double p1=Zr[t1][i]*Zr[t1][i]+Zi[t1][i]*Zi[t1][i];
+        int tb = (p1>p0)? t1 : t0;
+        wr[i]=Zr[tb][i]; wi[i]=Zi[tb][i];
+    }
+
+    /* fit residual frequency and drift to those decisions */
+    vensure();
+    {
+        double bdd=0.0,bu=0.0,bval=-1.0;
+        for(int stage=0;stage<2;stage++){
+            double lo,hi,st;
+            if(stage==0){lo=-1.2;hi=1.2;st=0.01;} else {lo=bdd-0.012;hi=bdd+0.012;st=0.0015;}
+            for(double dd=lo; dd<=hi+1e-12; dd+=st){
+                double acc=0.0;
+                for(i=0;i<nsym;i++){ psi[i]=acc;
+                    acc += 2.0*pi*tsym*dd*((double)i-(double)(nsym-1)/2.0)/(double)nsym; }
+                double u,v=vpeak(wr,wi,0,nsym,psi,&u);
+                if(v>bval){ bval=v; bdd=dd; bu=u; }
+            }
+        }
+        double acc=0.0;
+        for(i=0;i<nsym;i++){ psi[i]=acc+2.0*pi*bu*i;
+            acc += 2.0*pi*tsym*bdd*((double)i-(double)(nsym-1)/2.0)/(double)nsym; }
+    }
+    /* de-rotate everything by the fitted carrier */
+    for(i=0;i<nsym;i++){
+        double c=cos(-psi[i]), s=sin(-psi[i]);
+        for(t=0;t<4;t++){
+            double a=Zr[t][i]*c-Zi[t][i]*s, b=Zr[t][i]*s+Zi[t][i]*c;
+            Zr[t][i]=a; Zi[t][i]=b;
+        }
+        double a=wr[i]*c-wi[i]*s, b=wr[i]*s+wi[i]*c;
+        wr[i]=a; wi[i]=b;
+    }
+
+    /* Leave-one-out smoothed channel estimate, then two decision-directed
+       iterations.  Symbols are weighted by how reliable their own decision
+       looks, so the ones the demodulator is unsure about do not drag the
+       channel estimate around; the second pass re-decides using the coherent
+       metric from the first, which is a better decision to direct with. */
+    double fsymb[162], csr[163], csi[163];
+    int half = nsmooth/2;
+    for(int iter=0; iter<2; iter++){
+        if(iter>0){
+            /* re-decide from the coherent metric of the previous iteration */
+            for(i=0;i<nsym;i++){
+                int t0=pr3[i], t1=pr3[i]+2;
+                int tb = (fsymb[i]>0.0)? t1 : t0;
+                double a0=sqrt(Zr[t0][i]*Zr[t0][i]+Zi[t0][i]*Zi[t0][i]);
+                double a1=sqrt(Zr[t1][i]*Zr[t1][i]+Zi[t1][i]*Zi[t1][i]);
+                double rel=fabs(a1-a0)/(a1+a0+1e-30);
+                wr[i]=Zr[tb][i]*rel; wi[i]=Zi[tb][i]*rel;
+            }
+        } else {
+            for(i=0;i<nsym;i++){
+                int t0=pr3[i], t1=pr3[i]+2;
+                double a0=sqrt(Zr[t0][i]*Zr[t0][i]+Zi[t0][i]*Zi[t0][i]);
+                double a1=sqrt(Zr[t1][i]*Zr[t1][i]+Zi[t1][i]*Zi[t1][i]);
+                int tb = (a1>a0)? t1 : t0;
+                double rel=fabs(a1-a0)/(a1+a0+1e-30);
+                wr[i]=Zr[tb][i]*rel; wi[i]=Zi[tb][i]*rel;
+            }
+        }
+        csr[0]=0; csi[0]=0;
+        for(i=0;i<nsym;i++){ csr[i+1]=csr[i]+wr[i]; csi[i+1]=csi[i]+wi[i]; }
+        for(i=0;i<nsym;i++){
+            int a=i-half, b=i+half;
+            if(a<0){ b-=a; a=0; }
+            if(b>nsym-1){ a-=(b-(nsym-1)); b=nsym-1; if(a<0)a=0; }
+            double hr=csr[b+1]-csr[a]-wr[i];      /* leave this symbol out */
+            double hi=csi[b+1]-csi[a]-wi[i];
+            double hm=sqrt(hr*hr+hi*hi);
+            if(hm<1e-20){ fsymb[i]=0.0; continue; }
+            hr/=hm; hi/=hm;
+            int t0=pr3[i], t1=pr3[i]+2;
+            double r1=Zr[t1][i]*hr+Zi[t1][i]*hi;   /* Re{ z . conj(h) } */
+            double r0=Zr[t0][i]*hr+Zi[t0][i]*hi;
+            fsymb[i]=r1-r0;
+        }
+    }
+
+    double fsum=0.0,f2sum=0.0;
+    for(i=0;i<nsym;i++){ fsum+=fsymb[i]/nsym; f2sum+=fsymb[i]*fsymb[i]/nsym; }
+    double fac=sqrt(f2sum-fsum*fsum);
+    if(fac<=0.0) fac=1.0;
+    for(i=0;i<nsym;i++){
+        double v=symfac*fsymb[i]/fac;
+        if(v>127.0) v=127.0;
+        if(v<-128.0) v=-128.0;
+        symbols[i]=(unsigned char)(v+128.5);
+    }
+}
+
 /***************************************************************************
  symbol-by-symbol signal subtraction
  ****************************************************************************/
@@ -722,7 +945,8 @@ void usage(void)
     printf("       -J use the stack decoder instead of Fano decoder\n");
     printf("       -m decode wspr-15 .wav file\n");
     printf("       -N n demodulator trials on the last pass (default 4 = unchanged):\n");
-    printf("            6 adds noncoherent block lengths 6 and 9\n");
+    printf("            6 adds noncoherent block lengths 6 and 9,\n");
+    printf("            7..14 add coherent demodulation, smoothing 162,81,41,27,15,9,5,3\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
     printf("       -s single pass mode, no subtraction (same as original wsprd)\n");
@@ -752,9 +976,11 @@ int main(int argc, char *argv[])
     /* Demodulator trials made on the final pass.  These are block lengths for
        noncoherent_sequence_detection, which supports 1,2,3,6,9 -- its arrays are
        sized 512 = 2^9 for exactly that -- but which wsprd has never asked for
-       beyond 3.  Trials run in order and the first success wins. */
-    static const int bstab[6]={1,2,3,1,6,9};
-    static const int bmtab[6]={0,0,0,1,0,0};
+       beyond 3.  Negative entries select the coherent demodulator with that many
+       symbols of channel smoothing.  Trials run in order and the first success
+       wins, so added trials can only ever add decodes. */
+    static const int bstab[14]={1,2,3,1,6,9,-162,-81,-41,-27,-15,-9,-5,-3};
+    static const int bmtab[14]={0,0,0,1,0,0,0,0,0,0,0,0,0,0};
     int nbtrials=4;
     int nhardmin,ihash;
     int writec2=0,maxdrift;
@@ -840,7 +1066,7 @@ int main(int argc, char *argv[])
             case 'N':
                 nbtrials=(int)strtol(optarg,NULL,10);
                 if(nbtrials<1) nbtrials=1;
-                if(nbtrials>6) nbtrials=6;
+                if(nbtrials>14) nbtrials=14;
                 break;
             case 'c':
                 writec2=1;
@@ -1345,8 +1571,13 @@ int main(int argc, char *argv[])
                     
                     // Get soft-decision symbols
                     t0 = clock();
-                    noncoherent_sequence_detection(idat, qdat, npoints, symbols, &f1,
-                                                   &jittered_shift, &drift1, symfac, &blocksize, &bitmetric);
+                    if( blocksize < 0 ) {
+                        coherent_sequence_detection(idat, qdat, npoints, symbols, &f1,
+                                                    &jittered_shift, &drift1, symfac, -blocksize);
+                    } else {
+                        noncoherent_sequence_detection(idat, qdat, npoints, symbols, &f1,
+                                                       &jittered_shift, &drift1, symfac, &blocksize, &bitmetric);
+                    }
                     tsync2 += (float)(clock()-t0)/CLOCKS_PER_SEC;
                     
                     sq=0.0;
@@ -1486,7 +1717,7 @@ int main(int argc, char *argv[])
                     decodes[uniques-1].drift=drift1;
                     decodes[uniques-1].cycles=cycles;
                     decodes[uniques-1].jitter=ii;
-                    decodes[uniques-1].blocksize=blocksize+3*bitmetric;
+                    decodes[uniques-1].blocksize=blocksize<0?blocksize:blocksize+3*bitmetric;
                     decodes[uniques-1].metric=metric;
                     decodes[uniques-1].nhardmin=nhardmin;
                     decodes[uniques-1].ipass=ipass;
