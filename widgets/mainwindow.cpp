@@ -2525,7 +2525,8 @@ void MainWindow::dataSink(qint64 frames)
       t2 << "-f" << QString {"%1"}.arg (m_dialFreqRxWSPR / 1e6, 0, 'f', 6);
       if((m_ndepth&7)==1) depth_args << "-qB"; //2 pass w subtract, no Block detection, no shift jittering
       if((m_ndepth&7)==2) depth_args << "-C" << "500" << "-o" << "4"; //3 pass, subtract, Block detection, OSD
-      if((m_ndepth&7)==3) depth_args << "-C" << "500"  << "-o" << "4" << "-d"; //3 pass, subtract, Block detect, OSD, more candidates
+      //3 pass, subtract, Block detect, OSD, more candidates, coherent demodulation
+      if((m_ndepth&7)==3) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "14";
       m_cmndP1.clear ();
       if(m_diskData) {
         m_cmndP1 << depth_args << "-a"
