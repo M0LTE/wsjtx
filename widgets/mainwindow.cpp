@@ -2526,8 +2526,6 @@ void MainWindow::dataSink(qint64 frames)
       if((m_ndepth&7)==1) depth_args << "-qB"; //2 pass w subtract, no Block detection, no shift jittering
       if((m_ndepth&7)==2) depth_args << "-C" << "500" << "-o" << "4"; //3 pass, subtract, Block detection, OSD
       if((m_ndepth&7)==3) depth_args << "-C" << "500"  << "-o" << "4" << "-d"; //3 pass, subtract, Block detect, OSD, more candidates
-      QStringList degrade;
-      degrade << "-d" << QString {"%1"}.arg (m_config.degrade(), 4, 'f', 1);
       m_cmndP1.clear ();
       if(m_diskData) {
         m_cmndP1 << depth_args << "-a"
