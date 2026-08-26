@@ -292,10 +292,10 @@ subroutine boxit(reset,e2,ntau,npindex,i1,i2)
   common/boxes/indexes,fp,np
 
   if(reset) then
-    patterns=-1
-    fp=-1
+! fp is indexed by an ntau-bit pattern, so only the first 2**ntau entries are
+! ever used.  Clearing all 525001 of them moves 2 MB per OSD call for nothing.
+    fp(0:ishft(1,ntau)-1)=-1
     np=-1
-    sc=-1
     indexes=-1
     reset=.false.
   endif
