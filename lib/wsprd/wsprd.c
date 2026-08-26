@@ -50,7 +50,7 @@ extern void osdwspr_ (float [], unsigned char [], int *, unsigned char [], int *
 // Possible PATIENCE options: FFTW_ESTIMATE, FFTW_ESTIMATE_PATIENT,
 // FFTW_MEASURE, FFTW_PATIENT, FFTW_EXHAUSTIVE
 #define PATIENCE FFTW_ESTIMATE
-fftwf_plan PLAN1,PLAN2,PLAN3;
+fftwf_plan PLAN1=NULL,PLAN2=NULL,PLAN3=NULL;
 
 unsigned char pr3[162]=
 {1,1,0,0,0,0,0,0,1,0,0,0,1,1,1,0,0,0,1,0,
@@ -64,6 +64,10 @@ unsigned char pr3[162]=
     0,0};
 
 int printdata=0;
+
+int g_nbpct  = 0;     /* noise blanker: blank the strongest g_nbpct% of samples */
+int g_ndrop  = 1;     /* ...and this many samples after each hit                */
+int g_nbauto = 0;     /* sweep the blanker and keep whatever any setting finds  */
 
 //***************************************************************************
 unsigned long readc2file(char *ptr_to_infile, float *idat, float *qdat,
@@ -102,6 +106,27 @@ unsigned long readc2file(char *ptr_to_infile, float *idat, float *qdat,
         return (unsigned long) nr/2;
     } else {
         return 1;
+    }
+}
+
+/* Hard noise blanker, the same rule as lib/blanker.f90 which FST4 and FST4W
+   already use.  Find the amplitude exceeded by npct/ndropmax of the samples,
+   zero those and the ndropmax samples that follow. */
+static void blank_impulses(short *x, size_t nz, int npct, int ndropmax)
+{
+    if(npct<=0) return;
+    static int hist[32769];
+    memset(hist,0,sizeof hist);
+    for(size_t i=0;i<nz;i++){
+        if(x[i]==-32768) x[i]=-32767;
+        hist[abs(x[i])]++;
+    }
+    long n=0, want=(long)(nz*0.01*npct/ndropmax+0.5), nthresh=0;
+    for(int i=32768;i>=0;i--){ n+=hist[i]; if(n>=want){ nthresh=i; break; } }
+    int ndrop=0;
+    for(size_t i=0;i<nz;i++){
+        if(ndrop>0){ x[i]=0; ndrop--; continue; }
+        if(abs(x[i])>nthresh){ x[i]=0; ndrop=ndropmax; }
     }
 }
 
@@ -146,12 +171,16 @@ unsigned long readwavfile(char *ptr_to_infile, int ntrmin, float *idat, float *q
     nr=fread(buf2,2,22,fp);      //Read and ignore header
     nr=fread(buf2,2,npoints,fp); //Read raw data
     fclose(fp);
+    if(nr>0) blank_impulses(buf2,nr,g_nbpct,g_ndrop);
     if( nr == 0 ) {
         free(buf2);
         fprintf(stderr, "No data in file '%s'\n", ptr_to_infile);
         return 1;
     }	
     
+    /* re-entrant: the blanker sweep reads the file more than once */
+    if(PLAN1){ fftwf_destroy_plan(PLAN1); PLAN1=NULL; }
+    if(PLAN2){ fftwf_destroy_plan(PLAN2); PLAN2=NULL; }
     realin=(float*) fftwf_malloc(sizeof(float)*nfft1);
     fftout=(fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*(nfft1/2+1));
     PLAN1 = fftwf_plan_dft_r2c_1d(nfft1, realin, fftout, PATIENCE);
@@ -944,6 +973,8 @@ void usage(void)
     printf("       -H do not use (or update) the hash table\n");
     printf("       -J use the stack decoder instead of Fano decoder\n");
     printf("       -m decode wspr-15 .wav file\n");
+    printf("       -n x noise blanker: blank the strongest x%% of samples (0=off, default 0);\n");
+    printf("            -n a sweeps 0,3,6,10,15,20%% and keeps every decode any of them finds\n");
     printf("       -N n demodulator trials on the last pass (default 4 = unchanged):\n");
     printf("            6 adds noncoherent block lengths 6 and 9,\n");
     printf("            7..14 add coherent demodulation, smoothing 162,81,41,27,15,9,5,3\n");
@@ -1055,13 +1086,19 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:BcC:de:f:HJmN:o:qstwvz:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:BcC:de:f:Hn:N:Jmo:qstwvz:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
                 break;
             case 'B':
                 npasses=2;
+                break;
+            case 'n':
+                if(optarg[0]=='a'){ g_nbauto=1; break; }
+                g_nbpct=(int)strtol(optarg,NULL,10);
+                if(g_nbpct<0) g_nbpct=0;
+                if(g_nbpct>50) g_nbpct=50;
                 break;
             case 'N':
                 nbtrials=(int)strtol(optarg,NULL,10);
@@ -1179,6 +1216,7 @@ int main(int argc, char *argv[])
     }
     ftimer=fopen(timer_fname,"w");
     
+    int isc2 = 0;
     if( strstr(ptr_to_infile,".wav") ) {
         ptr_to_infile_suffix=strstr(ptr_to_infile,".wav");
         
@@ -1192,6 +1230,7 @@ int main(int argc, char *argv[])
         dialfreq=dialfreq_cmdline - (dialfreq_error*1.0e-06);
     } else if ( strstr(ptr_to_infile,".c2") !=0 )  {
         ptr_to_infile_suffix=strstr(ptr_to_infile,".c2");
+        isc2 = 1;
         npoints=readc2file(ptr_to_infile, idat, qdat, &dialfreq, &wspr_type);
         if( npoints == 1 ) {
             return 1;
@@ -1242,6 +1281,19 @@ int main(int argc, char *argv[])
     fmin += dialfreq_error;        // dialfreq_error is in units of Hz
     fmax += dialfreq_error;
 
+    /* Noise-blanker sweep.  A fixed setting is a bad idea: on clean gaussian
+       noise, blanking 10% of the samples costs about 2.6 dB.  Trying several and
+       keeping every decode any of them finds costs nothing on a quiet band and
+       is worth several dB on an impulsive one.  Same shape as the NB=Auto that
+       FST4 and FST4W already have. */
+    static const int nbtab[6]={0,3,6,10,15,20};
+    int nnb = (g_nbauto && !isc2) ? 6 : 1;
+    for (int inb=0; inb<nnb; inb++) {
+      if( g_nbauto && !isc2 ) {
+        g_nbpct = nbtab[inb];
+        npoints = readwavfile(ptr_to_infile, wspr_type, idat, qdat);
+        if( npoints == 1 ) break;
+      }
     //*************** main loop starts here *****************
     for (ipass=0; ipass<npasses; ipass++) {
         if(ipass==1 && ndecodes_pass == 0 && npasses>2) ipass=2;
@@ -1726,7 +1778,7 @@ int main(int argc, char *argv[])
             }
         }
         
-        if( ipass == 0 && writec2 ) {
+        if( ipass == 0 && writec2 && inb == 0 ) {
             char c2filename[15];
             double carrierfreq=dialfreq;
             int wsprtype=2;
@@ -1734,6 +1786,7 @@ int main(int argc, char *argv[])
             printf("Writing %s\n",c2filename);
             writec2file(c2filename, wsprtype, carrierfreq, idat, qdat);
         }
+    }
     }
     
     // sort the result in order of increasing frequency
