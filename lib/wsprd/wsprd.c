@@ -996,6 +996,12 @@ int main(int argc, char *argv[])
         fclose(fhash);
     }
     
+    // Compute corrected fmin, fmax, accounting for dial frequency error.  This
+    // belongs outside the pass loop: applied once per pass, three passes moved
+    // the search window by three times the error.
+    fmin += dialfreq_error;        // dialfreq_error is in units of Hz
+    fmax += dialfreq_error;
+
     //*************** main loop starts here *****************
     for (ipass=0; ipass<npasses; ipass++) {
         if(ipass==1 && ndecodes_pass == 0 && npasses>2) ipass=2;
@@ -1104,10 +1110,6 @@ int main(int argc, char *argv[])
                 }
             }
         }
-        
-        // Compute corrected fmin, fmax, accounting for dial frequency error
-        fmin += dialfreq_error;    // dialfreq_error is in units of Hz
-        fmax += dialfreq_error;
         
         // Don't waste time on signals outside of the range [fmin,fmax].
         i=0;
