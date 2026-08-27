@@ -4848,7 +4848,7 @@ QPushButton[state=&quot;ok&quot;] {
     <addaction name="actionQuickDecode"/>
     <addaction name="actionMediumDecode"/>
     <addaction name="actionDeepestDecode"/>
-    <addaction name="actionDeeperDecode"/>
+    <addaction name="actionMaxDecode"/>
     <addaction name="separator"/>
     <addaction name="actionUse_multithreaded_FT8_decoder"/>
     <addaction name="menuParameters"/>
@@ -5103,12 +5103,12 @@ QPushButton[state=&quot;ok&quot;] {
     <string>Deep</string>
    </property>
   </action>
-  <action name="actionDeeperDecode">
+  <action name="actionMaxDecode">
    <property name="checkable">
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>Deeper</string>
+    <string>Max</string>
    </property>
    <property name="toolTip">
     <string>WSPR only: adds coherent demodulation, the noise blanker, narrowband interference excision and a wider timing search. Slower.</string>
