@@ -75,6 +75,8 @@ int g_nbauto = 0;     /* sweep the blanker and keep whatever any setting finds  
 int g_nthreads = 0;   /* 0 = one worker per logical processor                   */
 int g_keepdt = 0;     /* 1 = an unpackable OSD result fails just that attempt,
                          instead of abandoning the remaining DT offsets       */
+float g_minsync1 = -1.0f; /* -S overrides for the sync gates; negative values */
+float g_minsync2 = -1.0f; /* leave the stock thresholds alone                 */
 
 /* Per-symbol signal and noise, taken from the four tone energies.  For each
    symbol the sync vector allows two tones and rules out the other two; the
@@ -1386,6 +1388,10 @@ void usage(void)
     printf("       -P n worker threads: 0 = one per logical processor (default), 1 = serial\n");
     printf("       -A after an unpackable OSD result keep trying the remaining DT\n");
     printf("          offsets, rather than abandoning them as stock wsprd does\n");
+    printf("       -S s1,s2 override the sync gates: s1 admits candidates to the fine\n");
+    printf("          lag and frequency refinement (default 0.10), s2 admits them to\n");
+    printf("          the demodulator (default 0.12, final pass 0.10); negative keeps\n");
+    printf("          the default.  -S 0,-1 refines every candidate\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
     printf("       -s single pass mode, no subtraction (same as original wsprd)\n");
     printf("       -v verbose mode (shows dupes)\n");
@@ -1493,7 +1499,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:ABcC:de:f:Hn:N:P:Jmo:qstwvX:z:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:ABcC:de:f:Hn:N:P:JmS:o:qstwvX:z:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1509,6 +1515,9 @@ int main(int argc, char *argv[])
                 break;
             case 'A':
                 g_keepdt=1;
+                break;
+            case 'S':
+                sscanf(optarg,"%f,%f",&g_minsync1,&g_minsync2);
                 break;
             case 'P':
                 g_nthreads=(int)strtol(optarg,NULL,10);
@@ -1742,6 +1751,8 @@ int main(int argc, char *argv[])
             maxdrift=0;    // no drift for smaller frequency estimator variance
             minsync2=0.10;
         }
+        if(g_minsync1>=0.0f) minsync1=g_minsync1;
+        if(g_minsync2>=0.0f) minsync2=g_minsync2;
         ndecodes_pass=0;   // still needed?
         
         /* one independent 512-point transform per half-symbol step */
