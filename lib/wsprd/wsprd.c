@@ -1392,6 +1392,8 @@ void usage(void)
     printf("          lag and frequency refinement (default 0.10), s2 admits them to\n");
     printf("          the demodulator (default 0.12, final pass 0.10); negative keeps\n");
     printf("          the default.  -S 0,-1 refines every candidate\n");
+    printf("       -Y n decode passes (default 3); extra passes repeat the final pass\n");
+    printf("          on what remains after another round of subtraction\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
     printf("       -s single pass mode, no subtraction (same as original wsprd)\n");
     printf("       -v verbose mode (shows dupes)\n");
@@ -1499,7 +1501,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:ABcC:de:f:Hn:N:P:JmS:o:qstwvX:z:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:ABcC:de:f:Hn:N:P:JmS:o:qstwvX:Y:z:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1518,6 +1520,11 @@ int main(int argc, char *argv[])
                 break;
             case 'S':
                 sscanf(optarg,"%f,%f",&g_minsync1,&g_minsync2);
+                break;
+            case 'Y':
+                npasses=(int)strtol(optarg,NULL,10);
+                if(npasses<1) npasses=1;
+                if(npasses>8) npasses=8;
                 break;
             case 'P':
                 g_nthreads=(int)strtol(optarg,NULL,10);
@@ -1746,7 +1753,7 @@ int main(int argc, char *argv[])
             maxdrift=4;
             minsync2=0.12;
         }
-        if(ipass == 2 ) {
+        if(ipass >= 2 ) {
             nblocksize=nbtrials;
             maxdrift=0;    // no drift for smaller frequency estimator variance
             minsync2=0.10;
