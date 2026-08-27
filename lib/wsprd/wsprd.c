@@ -284,19 +284,6 @@ done:
     free(P); free(Ps); free(F); free(mk); free(sc); free(bm);
 }
 
-/* Aggressiveness presets.  Index 0 is off, so a sweep that starts at 0 can only
-   ever add decodes to what the unexcised decoder already found. */
-static void fex_preset(int k)
-{
-    switch(k){
-      case 0: g_fex=0; break;
-      case 1: g_fex=1; g_fexT1=1000.0f; g_fexT2=300.0f; g_fexT3=2.0f; g_fexW=2048; break;
-      case 2: g_fex=1; g_fexT1= 200.0f; g_fexT2=150.0f; g_fexT3=1.6f; g_fexW=3072; break;
-      default: g_fex=0; break;
-    }
-}
-#define FEX_NPRESET 3
-
 /* Hard noise blanker, the same rule as lib/blanker.f90 which FST4 and FST4W
    already use.  Find the amplitude exceeded by npct/ndropmax of the samples,
    zero those and the ndropmax samples that follow. */
@@ -1340,7 +1327,7 @@ int main(int argc, char *argv[])
     extern char *optarg;
     extern int optind;
     int i,j,k;
-    unsigned char *symbols, *decdata, *channel_symbols, *apmask, *cw;
+    unsigned char *symbols, *decdata, *channel_symbols;
     signed char message[]={-9,13,-35,123,57,-39,64,0,0,0,0};
     char *callsign, *grid,  *call_loc_pow;
     char *ptr_to_infile,*ptr_to_infile_suffix;
@@ -1363,7 +1350,6 @@ int main(int argc, char *argv[])
     int writec2=0,maxdrift;
     int shift1, not_decoded;
     unsigned int nbits=81, stacksize=200000;
-    struct snode * stack=NULL;
     unsigned int npoints, cycles, metric;
     float df=375.0/256.0/2;
     float dt=1.0/375.0, dt_print;
@@ -1395,8 +1381,6 @@ int main(int argc, char *argv[])
     loctab=calloc(32768*5,sizeof(char));
     int nh;
     symbols=calloc(nbits*2,sizeof(unsigned char));
-    apmask=calloc(162,sizeof(unsigned char));
-    cw=calloc(162,sizeof(unsigned char));
     decdata=calloc(11,sizeof(unsigned char));
     channel_symbols=calloc(nbits*2,sizeof(unsigned char));
     callsign=calloc(13,sizeof(char));
@@ -1542,7 +1526,6 @@ int main(int argc, char *argv[])
     if( stackdecoder ) {            /* the stack decoder needs one per worker */
         stacks = calloc(nworkers,sizeof(struct snode*));
         for(i=0;i<nworkers;i++) stacks[i]=calloc(stacksize,sizeof(struct snode));
-        stack=stacks[0];
     }
 
     // setup metric table
@@ -1988,7 +1971,7 @@ int main(int argc, char *argv[])
         ctx.maxcycles=maxcycles; ctx.nbits=nbits; ctx.stacksize=stacksize;
         ctx.minrms=minrms; ctx.hashtab=hashtab; ctx.loctab=loctab;
 
-        int ii, jittered_shift;
+        int ii;
         int blocksize, bitmetric;
         int osd_decode;
         for (j=0; j<nwat; j++) {
@@ -2049,7 +2032,6 @@ int main(int argc, char *argv[])
                 blocksize      = best.blocksize;
                 bitmetric      = best.bitmetric;
                 ii             = best.jitter;
-                jittered_shift = best.shift;
                 metric         = best.metric;
                 cycles         = best.cycles;
                 nhardmin       = best.nhardmin;
