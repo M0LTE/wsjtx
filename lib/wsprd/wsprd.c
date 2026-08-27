@@ -160,7 +160,7 @@ unsigned long readc2file(char *ptr_to_infile, float *idat, float *qdat,
    would stop the notch growing out of the skirt that produced it.
    ------------------------------------------------------------------------- */
 
-int   g_fex      = 1;       /* on by default; -X 0 restores the old path    */
+int   g_fex      = 0;       /* off unless asked for: it can remove a signal  */
 int   g_fexauto  = 0;       /* sweep the aggressiveness, keep every decode  */
 float g_fexT1    = 1000.0f; /* peak / local floor, to be a spur at all      */
 float g_fexT2    = 300.0f;  /* peak / max(side medians), the narrowness test*/

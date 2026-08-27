@@ -306,6 +306,7 @@ private slots:
   void on_actionQuickDecode_toggled (bool);
   void on_actionMediumDecode_toggled (bool);
   void on_actionDeepestDecode_toggled (bool);
+  void on_actionDeeperDecode_toggled (bool);
 
   //ft8md
   void on_actionDecFT8cycles1_triggered();
