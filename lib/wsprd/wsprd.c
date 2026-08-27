@@ -76,6 +76,46 @@ int g_nthreads = 0;   /* 0 = one worker per logical processor                   
 int g_keepdt = 0;     /* 1 = an unpackable OSD result fails just that attempt,
                          instead of abandoning the remaining DT offsets       */
 
+/* Per-symbol signal and noise, taken from the four tone energies.  For each
+   symbol the sync vector allows two tones and rules out the other two; the
+   ruled-out pair is pure noise, and the allowed pair carries the signal plus
+   the same noise again.  With e_used and e_unused summed per symbol:
+       mean(e_unused) = 4 sigma^2                (two noise-only tones)
+       mean(e_used)   = A_i^2 + 4 sigma^2
+   sigma is estimated once across the whole transmission, because flat fading
+   moves the signal and leaves the noise where it is; A_i is estimated per
+   symbol and smoothed over a few symbols to keep it from being dominated by
+   its own two-sample noise.  Scaling soft symbol i by (A_i/sigma)^wexp is
+   maximal-ratio combining at wexp=1; wexp=0.5 measured best and is what the
+   weighted trials use. */
+static void persym_weights(const double *e_used, const double *e_unused,
+                           double *w, int nsym, int win, double wexp)
+{
+    int i,k;
+    double s2=0.0;
+    for(i=0;i<nsym;i++) s2 += e_unused[i];
+    s2 /= (4.0*nsym);
+    if(s2<=0.0){ for(i=0;i<nsym;i++) w[i]=1.0; return; }
+    int half=win/2;
+    for(i=0;i<nsym;i++){
+        double acc=0.0; int n=0;
+        for(k=i-half;k<=i+half;k++){
+            if(k<0||k>=nsym) continue;
+            acc += e_used[k]-4.0*s2;
+            n++;
+        }
+        double a2 = n? acc/n : 0.0;
+        if(a2<0.0) a2=0.0;
+        w[i] = pow(sqrt(a2/s2), wexp);
+    }
+    /* keep the average weight at unity so the global scaling downstream, and
+       the metric table it feeds, see the same overall level as before */
+    double m=0.0;
+    for(i=0;i<nsym;i++) m+=w[i];
+    m/=nsym;
+    if(m>0.0) for(i=0;i<nsym;i++) w[i]/=m;
+}
+
 /* wall clock, because CPU-seconds stop meaning much once we thread */
 static double wsecs(void)
 {
@@ -566,7 +606,8 @@ void sync_and_demodulate(float *id, float *qd, long np,
 
 void noncoherent_sequence_detection(float *id, float *qd, long np,
                                     unsigned char *symbols, float *f1,  int *shift1,
-                                    float *drift1, int symfac, int *nblocksize, int *bitmetric)
+                                    float *drift1, int symfac, int *nblocksize, int *bitmetric,
+                                    float wexp)
 {
     /************************************************************************
      *  Noncoherent sequence detection for wspr.                            *
@@ -693,6 +734,18 @@ void noncoherent_sequence_detection(float *id, float *qd, long np,
             }
         }
     }
+    if( wexp != 0.0f ) {
+        double eu[162], ev[162], wt[162];
+        for(i=0;i<162;i++){
+            int t0=pr3[i], t1=pr3[i]+2, u0=1-pr3[i], u1=3-pr3[i];
+            eu[i] = (double)is[t0][i]*is[t0][i]+(double)qs[t0][i]*qs[t0][i]
+                  + (double)is[t1][i]*is[t1][i]+(double)qs[t1][i]*qs[t1][i];
+            ev[i] = (double)is[u0][i]*is[u0][i]+(double)qs[u0][i]*qs[u0][i]
+                  + (double)is[u1][i]*is[u1][i]+(double)qs[u1][i]*qs[u1][i];
+        }
+        persym_weights(eu,ev,wt,162,5,wexp);
+        for(i=0;i<162;i++) fsymb[i]=(float)(fsymb[i]*wt[i]);
+    }
     for (i=0; i<162; i++) {              //Normalize the soft symbols
         fsum=fsum+fsymb[i]/162.0;
         f2sum=f2sum+fsymb[i]*fsymb[i]/162.0;
@@ -781,7 +834,8 @@ static double vpeak(const double *zr,const double *zi,int i0,int L,
  *****************************************************************************/
 void coherent_sequence_detection(float *id, float *qd, long np,
                                  unsigned char *symbols, float *f1, int *shift1,
-                                 float *drift1, int symfac, int nsmooth)
+                                 float *drift1, int symfac, int nsmooth,
+                                 float wexp)
 {
     const double dt=1.0/375.0, df=375.0/256.0;
     const double pi=3.14159265358979323846, twopidt=2*pi*dt;
@@ -922,6 +976,18 @@ void coherent_sequence_detection(float *id, float *qd, long np,
         }
     }
 
+    if( wexp != 0.0f ) {
+        double eu[162], ev[162], wt[162];
+        for(i=0;i<nsym;i++){
+            int t0=pr3[i], t1=pr3[i]+2, u0=1-pr3[i], u1=3-pr3[i];
+            eu[i] = Zr[t0][i]*Zr[t0][i]+Zi[t0][i]*Zi[t0][i]
+                  + Zr[t1][i]*Zr[t1][i]+Zi[t1][i]*Zi[t1][i];
+            ev[i] = Zr[u0][i]*Zr[u0][i]+Zi[u0][i]*Zi[u0][i]
+                  + Zr[u1][i]*Zr[u1][i]+Zi[u1][i]*Zi[u1][i];
+        }
+        persym_weights(eu,ev,wt,nsym,5,wexp);
+        for(i=0;i<nsym;i++) fsymb[i]*=wt[i];
+    }
     double fsum=0.0,f2sum=0.0;
     for(i=0;i<nsym;i++){ fsum+=fsymb[i]/nsym; f2sum+=fsymb[i]*fsymb[i]/nsym; }
     double fac=sqrt(f2sum-fsum*fsum);
@@ -1197,7 +1263,7 @@ struct dec_ctx {
 };
 
 static void run_trial(const struct dec_ctx *c, float f1, int shift1, float drift1,
-                      int blocksize, int bitmetric, int jitter,
+                      int blocksize, int bitmetric, int jitter, float wexp,
                       struct snode *stack, struct trial_result *out)
 {
     unsigned char symbols[162*2], decdata[11], cw[162], apmask[162];
@@ -1216,11 +1282,12 @@ static void run_trial(const struct dec_ctx *c, float f1, int shift1, float drift
 
     if( blocksize < 0 ) {
         coherent_sequence_detection(c->idat, c->qdat, c->npoints, symbols, &f1,
-                                    &jittered_shift, &drift1, c->symfac, -blocksize);
+                                    &jittered_shift, &drift1, c->symfac, -blocksize,
+                                    wexp);
     } else {
         noncoherent_sequence_detection(c->idat, c->qdat, c->npoints, symbols, &f1,
                                        &jittered_shift, &drift1, c->symfac,
-                                       &blocksize, &bitmetric);
+                                       &blocksize, &bitmetric, wexp);
     }
 
     float sq=0.0;
@@ -1310,7 +1377,9 @@ void usage(void)
     printf("            -n a sweeps 0,3,6,10,15,20%% and keeps every decode any of them finds\n");
     printf("       -N n demodulator trials on the last pass (default 4 = unchanged):\n");
     printf("            6 adds noncoherent block lengths 6 and 9,\n");
-    printf("            7..14 add coherent demodulation, smoothing 162,81,41,27,15,9,5,3\n");
+    printf("            7..14 add coherent demodulation, smoothing 162,81,41,27,15,9,5,3,\n");
+    printf("            15..20 add fade-weighted retries of blocks 1,2,3 and\n");
+    printf("            coherent 27,9,5, which track a slowly fading signal\n");
     printf("       -X n narrowband interference excision: 1 = on (default), 0 = off,\n");
     printf("            2 = aggressive, a = sweep, or T1,T2,T3,W[,c] for raw thresholds\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
@@ -1348,8 +1417,11 @@ int main(int argc, char *argv[])
        beyond 3.  Negative entries select the coherent demodulator with that many
        symbols of channel smoothing.  Trials run in order and the first success
        wins, so added trials can only ever add decodes. */
-    static const int bstab[14]={1,2,3,1,6,9,-162,-81,-41,-27,-15,-9,-5,-3};
-    static const int bmtab[14]={0,0,0,1,0,0,0,0,0,0,0,0,0,0};
+    static const int bstab[20]={1,2,3,1,6,9,-162,-81,-41,-27,-15,-9,-5,-3,
+                               1,2,3,-27,-9,-5};   /* the last six are weighted */
+    static const int bmtab[20]={0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    static const float bwtab[20]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                                 0.5f,0.5f,0.5f,0.5f,0.5f,0.5f};
     int nbtrials=4;
     int nhardmin;
     int writec2=0,maxdrift;
@@ -1457,7 +1529,7 @@ int main(int argc, char *argv[])
             case 'N':
                 nbtrials=(int)strtol(optarg,NULL,10);
                 if(nbtrials<1) nbtrials=1;
-                if(nbtrials>14) nbtrials=14;
+                if(nbtrials>20) nbtrials=20;
                 break;
             case 'c':
                 writec2=1;
@@ -2036,7 +2108,7 @@ int main(int argc, char *argv[])
                     struct trial_result r;
                     run_trial(&ctx, candidates[j].freq, candidates[j].shift,
                               candidates[j].drift, bstab[tb], bmtab[tb], jj,
-                              stacks ? stacks[tid] : NULL, &r);
+                              bwtab[tb], stacks ? stacks[tid] : NULL, &r);
                     if( r.decoded || (r.abandoned && !g_keepdt) ) {
 #ifdef _OPENMP
 #pragma omp critical (wsprd_trialwin)
