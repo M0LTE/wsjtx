@@ -5111,7 +5111,7 @@ QPushButton[state=&quot;ok&quot;] {
     <string>Deeper</string>
    </property>
    <property name="toolTip">
-    <string>WSPR only: adds coherent demodulation, the noise blanker and narrowband interference excision. Slower.</string>
+    <string>WSPR only: adds coherent demodulation, the noise blanker, narrowband interference excision and a wider timing search. Slower.</string>
    </property>
   </action>
   <action name="actionErase_ALL_TXT">

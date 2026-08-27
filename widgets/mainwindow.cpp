@@ -2529,10 +2529,10 @@ void MainWindow::dataSink(qint64 frames)
       if((m_ndepth&7)==2) depth_args << "-C" << "500" << "-o" << "4"; //3 pass, subtract, Block detection, OSD
       //3 pass, subtract, Block detect, OSD, more candidates
       if((m_ndepth&7)==3) depth_args << "-C" << "500"  << "-o" << "4" << "-d";
-      //Deeper: as Deep, plus coherent demodulation, the auto noise blanker and
-      //narrowband interference excision
+      //Deeper: as Deep, plus coherent demodulation, the auto noise blanker,
+      //narrowband interference excision and the wider timing search
       if((m_ndepth&7)==4) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "14"
-                                     << "-n" << "a" << "-X" << "1";
+                                     << "-n" << "a" << "-X" << "1" << "-A";
       m_cmndP1.clear ();
       if(m_diskData) {
         m_cmndP1 << depth_args << "-a"

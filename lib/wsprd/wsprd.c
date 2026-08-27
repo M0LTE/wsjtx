@@ -73,6 +73,8 @@ int g_nbpct  = 0;     /* noise blanker: blank the strongest g_nbpct% of samples 
 int g_ndrop  = 1;     /* ...and this many samples after each hit                */
 int g_nbauto = 0;     /* sweep the blanker and keep whatever any setting finds  */
 int g_nthreads = 0;   /* 0 = one worker per logical processor                   */
+int g_keepdt = 0;     /* 1 = an unpackable OSD result fails just that attempt,
+                         instead of abandoning the remaining DT offsets       */
 
 /* wall clock, because CPU-seconds stop meaning much once we thread */
 static double wsecs(void)
@@ -1174,6 +1176,8 @@ unsigned int count_hard_errors( unsigned char *symbols, unsigned char *channel_s
  *****************************************************************************/
 struct trial_result {
     int decoded;
+    int abandoned;    /* OSD produced something unpackable: stock gives up on
+                         the rest of this setting's DT offsets here          */
     int blocksize, bitmetric, jitter, shift;
     unsigned int metric, cycles;
     int nhardmin, osd_decode;
@@ -1248,12 +1252,11 @@ static void run_trial(const struct dec_ctx *c, float f1, int shift1, float drift
                                         : (signed char)decdata[i];
         int n1,n2,n3,nadd,nu,ntype,itype,ihash;
         unpack50(message,&n1,&n2);
-        /* An implausible OSD result means this attempt failed.  Stock wsprd
-           breaks out of the whole jitter loop here, which silently abandons
-           the remaining DT offsets for this demodulator setting. */
-        if( !unpackcall(n1,callsign) ) return;
+        /* An OSD codeword that will not unpack.  Stock wsprd breaks out of the
+           whole DT loop here; the caller reproduces that from this flag. */
+        if( !unpackcall(n1,callsign) ) { out->abandoned=1; return; }
         callsign[12]=0;
-        if( !unpackgrid(n2, grid) ) return;
+        if( !unpackgrid(n2, grid) ) { out->abandoned=1; return; }
         grid[4]=0;
         ntype = (n2&127) - 64;
         if( (ntype >= 0) && (ntype <= 62) ) {
@@ -1264,7 +1267,7 @@ static void run_trial(const struct dec_ctx *c, float f1, int shift1, float drift
                 if( nu > 3 ) nadd=nu-3;
                 if( nu > 7 ) nadd=nu-7;
                 n3=n2/128+32768*(nadd-1);
-                if( !unpackpfx(n3,callsign) ) return;
+                if( !unpackpfx(n3,callsign) ) { out->abandoned=1; return; }
                 itype=2;
             }
             ihash=nhash(callsign,strlen(callsign),(uint32_t)146);
@@ -1312,6 +1315,8 @@ void usage(void)
     printf("            2 = aggressive, a = sweep, or T1,T2,T3,W[,c] for raw thresholds\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
     printf("       -P n worker threads: 0 = one per logical processor (default), 1 = serial\n");
+    printf("       -A after an unpackable OSD result keep trying the remaining DT\n");
+    printf("          offsets, rather than abandoning them as stock wsprd does\n");
     printf("       -q quick mode - doesn't dig deep for weak signals\n");
     printf("       -s single pass mode, no subtraction (same as original wsprd)\n");
     printf("       -v verbose mode (shows dupes)\n");
@@ -1416,7 +1421,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:BcC:de:f:Hn:N:P:Jmo:qstwvX:z:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:ABcC:de:f:Hn:N:P:Jmo:qstwvX:z:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1429,6 +1434,9 @@ int main(int argc, char *argv[])
                 g_nbpct=(int)strtol(optarg,NULL,10);
                 if(g_nbpct<0) g_nbpct=0;
                 if(g_nbpct>50) g_nbpct=50;
+                break;
+            case 'A':
+                g_keepdt=1;
                 break;
             case 'P':
                 g_nthreads=(int)strtol(optarg,NULL,10);
@@ -1991,43 +1999,55 @@ int main(int argc, char *argv[])
                sequential search would have stopped, so the answer does not
                depend on how many workers ran. */
             {
+            /* Stock wsprd walks the demodulator settings in order and, within
+               each one, walks the DT offsets in order until an attempt either
+               decodes or produces an OSD codeword that will not unpack -- the
+               latter abandons the rest of that setting's offsets.  So the
+               settings stay sequential, there being only a handful of them,
+               and the offsets, of which there are up to 129, run in parallel
+               and keep the lowest-numbered attempt that reached either
+               outcome.  That is the attempt stock would have stopped at. */
             int nidt = quickmode ? 1 : (128/iifac + 1);
-            int ntrials = nblocksize * nidt;
-            int best_t = ntrials;
+            int found = 0;
             struct trial_result best;
             best.decoded = 0;
             wt0 = wsecs();
+            for (int tb=0; tb<nblocksize && !found; tb++) {
+                int firstev = nidt;
+                struct trial_result evr;
+                evr.decoded = 0;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic,1)
 #endif
-            for (int t=0; t<ntrials; t++) {
-                int seen;
+                for (int td=0; td<nidt; td++) {
+                    int seen;
 #ifdef _OPENMP
 #pragma omp atomic read
 #endif
-                seen = best_t;
-                if( t > seen ) continue;      /* an earlier attempt already won */
-                int tb = t/nidt, td = t%nidt;
-                int jj = (td+1)/2;
-                if( td%2 == 1 ) jj = -jj;
-                jj = iifac*jj;
-                int tid = 0;
+                    seen = firstev;
+                    if( td > seen ) continue;   /* an earlier offset settled it */
+                    int jj = (td+1)/2;
+                    if( td%2 == 1 ) jj = -jj;
+                    jj = iifac*jj;
+                    int tid = 0;
 #ifdef _OPENMP
-                tid = omp_get_thread_num();
+                    tid = omp_get_thread_num();
 #endif
-                struct trial_result r;
-                run_trial(&ctx, candidates[j].freq, candidates[j].shift,
-                          candidates[j].drift, bstab[tb], bmtab[tb], jj,
-                          stacks ? stacks[tid] : NULL, &r);
-                if( r.decoded ) {
+                    struct trial_result r;
+                    run_trial(&ctx, candidates[j].freq, candidates[j].shift,
+                              candidates[j].drift, bstab[tb], bmtab[tb], jj,
+                              stacks ? stacks[tid] : NULL, &r);
+                    if( r.decoded || (r.abandoned && !g_keepdt) ) {
 #ifdef _OPENMP
 #pragma omp critical (wsprd_trialwin)
 #endif
-                    { if( t < best_t ) { best_t = t; best = r; } }
+                        { if( td < firstev ) { firstev = td; evr = r; } }
+                    }
                 }
+                if( firstev < nidt && evr.decoded ) { found = 1; best = evr; }
             }
             ttrials += (float)(wsecs()-wt0);
-            if( best_t < ntrials ) {
+            if( found ) {
                 not_decoded    = 0;
                 blocksize      = best.blocksize;
                 bitmetric      = best.bitmetric;
