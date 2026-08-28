@@ -23,6 +23,7 @@ macro (set_build_type)
   set (WSJT_RELEASE_CHANNEL "DEVEL" CACHE STRING "Build release channel: DEVEL, RC, or GA.")
   set_property (CACHE WSJT_RELEASE_CHANNEL PROPERTY STRINGS DEVEL RC GA)
   set (WSJT_RC_NUMBER "" CACHE STRING "Release candidate number used when WSJT_RELEASE_CHANNEL is RC.")
+  set (WSJT_VERSION_SUFFIX "" CACHE STRING "Version suffix replacing the channel derived one, e.g. -m0lte-1a2b3c4 for a fork build.")
 
   set (options GA)
   set (oneValueArgs RC)
@@ -65,6 +66,20 @@ macro (set_build_type)
     endif ()
     set (BUILD_TYPE_REVISION "-rc${WSJT_RC_NUMBER}")
   endif ()
+
+  # A build that is not upstream's needs to say so in the one place every
+  # user reads, the version in the title bar and in Help > About, otherwise
+  # a bug report against it is indistinguishable from one against stock.
+  # WSJT_VERSION_SUFFIX replaces the channel derived suffix rather than
+  # appending to it, so a fork build reads 3.0.2-m0lte-1a2b3c4 rather than
+  # 3.0.2-devel-m0lte-1a2b3c4.
+  if (WSJT_VERSION_SUFFIX)
+    if (NOT WSJT_VERSION_SUFFIX MATCHES "^[-.+~A-Za-z0-9]+$")
+      message (FATAL_ERROR "WSJT_VERSION_SUFFIX may only contain letters, digits, dot, plus, tilde and hyphen; got \"${WSJT_VERSION_SUFFIX}\".")
+    endif ()
+    set (BUILD_TYPE_REVISION "${WSJT_VERSION_SUFFIX}")
+  endif ()
+
   set (WSJT_RELEASE_CHANNEL "${_WSJT_RELEASE_CHANNEL}" CACHE STRING "Build release channel: DEVEL, RC, or GA." FORCE)
   message (STATUS "Building ${PROJECT_NAME} v${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}${BUILD_TYPE_REVISION}")
 endmacro ()

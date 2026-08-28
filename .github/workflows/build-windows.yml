@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: ""
+      version_suffix:
+        description: "Version suffix replacing the channel derived one, e.g. -m0lte-1a2b3c4"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   build:
@@ -176,6 +181,7 @@ jobs:
             -DWSJT_BUILD_TESTS=ON \
             -DWSJT_RELEASE_CHANNEL="${{ inputs.release_channel }}" \
             -DWSJT_RC_NUMBER="${{ inputs.rc_number }}" \
+            -DWSJT_VERSION_SUFFIX="${{ inputs.version_suffix }}" \
             -DPFUNIT_DIR="${{ steps.pfunit.outputs.pfunit_dir }}" \
             -DGFTL_DIR="${{ steps.pfunit.outputs.gftl_dir }}" \
             -DGFTL_SHARED_DIR="${{ steps.pfunit.outputs.gftl_shared_dir }}" \
