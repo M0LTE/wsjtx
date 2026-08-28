@@ -73,6 +73,12 @@ int g_nbpct  = 0;     /* noise blanker: blank the strongest g_nbpct% of samples 
 int g_ndrop  = 1;     /* ...and this many samples after each hit                */
 int g_nbauto = 0;     /* sweep the blanker and keep whatever any setting finds  */
 int g_nthreads = 0;   /* 0 = one worker per logical processor                   */
+short *g_rawbuf=NULL;   /* raw samples, stashed at the sweep's first read     */
+size_t g_rawn=0;
+float *g_oobenv=NULL;   /* magnitude of the out-of-band detection stream      */
+float  g_oobsig=0.0f;   /* its robust sigma                                   */
+int    g_oobmode=0;     /* 1 = sweep active: read once, reprocess thereafter  */
+float  g_nbk=0.0f;      /* blanking threshold in sigmas, 0 = no blanking      */
 int g_keepdt = 0;     /* 1 = an unpackable OSD result fails just that attempt,
                          instead of abandoning the remaining DT offsets       */
 float g_minsync1 = -1.0f; /* -S overrides for the sync gates; negative values */
@@ -387,10 +393,39 @@ unsigned long readwavfile(char *ptr_to_infile, int ntrmin, float *idat, float *q
     }
     
     buf2 = calloc(npoints,sizeof(short int));
-    nr=fread(buf2,2,22,fp);      //Read and ignore header
-    nr=fread(buf2,2,npoints,fp); //Read raw data
-    fclose(fp);
-    if(nr>0) blank_impulses(buf2,nr,g_nbpct,g_ndrop);
+    if( g_oobmode && g_rawbuf != NULL ) {
+        /* the sweep reprocesses the same recording; no need to read it again */
+        memcpy(buf2,g_rawbuf,g_rawn*sizeof(short int));
+        nr=g_rawn;
+        fclose(fp);
+    } else {
+        nr=fread(buf2,2,22,fp);      //Read and ignore header
+        nr=fread(buf2,2,npoints,fp); //Read raw data
+        fclose(fp);
+        if( g_oobmode && nr>0 ) {
+            g_rawbuf=malloc(npoints*sizeof(short int));
+            memcpy(g_rawbuf,buf2,npoints*sizeof(short int));
+            g_rawn=nr;
+        }
+    }
+    if( g_oobmode ) {
+        /* Blank where the OUT-OF-BAND detection stream is impulsive.  The
+           stream cannot contain the WSPR signals, so this can never mutilate
+           them, which is what made the raw percentile blanker fabricate
+           callsigns on a clean crowded band. */
+        if( g_nbk>0.0f && g_oobenv!=NULL && nr>0 ) {
+            float th=g_nbk*g_oobsig;
+            for(i=0; i<npoints; i++){
+                if( g_oobenv[i]>th ){
+                    buf2[i]=0;
+                    if(i>0) buf2[i-1]=0;
+                    if(i+1<npoints) buf2[i+1]=0;
+                }
+            }
+        }
+    } else {
+        if(nr>0) blank_impulses(buf2,nr,g_nbpct,g_ndrop);
+    }
     if( nr == 0 ) {
         free(buf2);
         fprintf(stderr, "No data in file '%s'\n", ptr_to_infile);
@@ -415,6 +450,34 @@ unsigned long readwavfile(char *ptr_to_infile, int ntrmin, float *idat, float *q
     
     fftwf_execute(PLAN1);
     fftwf_free(realin);
+
+    if( g_oobmode && g_oobenv==NULL ) {
+        /* Build the detection stream once, from the unblanked spectrum:
+           300..5500 Hz minus a generous 1200..1800 Hz around the WSPR band. */
+        fftwf_complex *oc=(fftwf_complex*)fftwf_malloc(sizeof(fftwf_complex)*(nfft1/2+1));
+        memcpy(oc,fftout,sizeof(fftwf_complex)*(nfft1/2+1));
+        int jlo=(int)(300.0/df), jhi=(int)(5500.0/df);
+        int klo=(int)(1200.0/df), khi=(int)(1800.0/df);
+        int jj;
+        for(jj=0;jj<=nfft1/2;jj++){
+            if( jj<jlo || jj>jhi || (jj>=klo && jj<=khi) ){ oc[jj][0]=0.0f; oc[jj][1]=0.0f; }
+        }
+        float *ox=(float*)fftwf_malloc(sizeof(float)*nfft1);
+        fftwf_plan op=fftwf_plan_dft_c2r_1d(nfft1,oc,ox,FFTW_ESTIMATE);
+        fftwf_execute(op);
+        fftwf_destroy_plan(op);
+        fftwf_free(oc);
+        g_oobenv=malloc(npoints*sizeof(float));
+        for(i=0;i<npoints;i++) g_oobenv[i]=fabsf(ox[i]);
+        fftwf_free(ox);
+        long ns=0;
+        float *sm=malloc((npoints/8+1)*sizeof(float));
+        for(i=0;i<npoints;i+=8) sm[ns++]=g_oobenv[i];
+        qsort(sm,ns,sizeof(float),floatcomp);
+        g_oobsig=1.4826f*sm[ns/2];
+        free(sm);
+        if(g_oobsig<=0.0f) g_oobsig=1.0f;
+    }
     
     fftin=(fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*nfft2);
     
@@ -1738,10 +1801,24 @@ int main(int argc, char *argv[])
        is worth several dB on an impulsive one.  Same shape as the NB=Auto that
        FST4 and FST4W already have. */
     static const int nbtab[6]={0,3,6,10,15,20};
+    static const float nbktab[6]={0.0f,8.0f,6.0f,5.0f,4.0f,3.0f};
     int nnb = (g_nbauto && !isc2) ? 6 : 1;
+    if( nnb>1 && wspr_type==2 ) g_oobmode=1;
+    long lastnh=0;   /* hit count of the previous executed round; 0 = unblanked */
     for (int inb=0; inb<nnb; inb++) {
       if( g_nbauto && !isc2 ) {
-        g_nbpct = nbtab[inb];
+        if( g_oobmode ) { g_nbk=nbktab[inb]; g_nbpct=0; }
+        else g_nbpct = nbtab[inb];
+        if( g_oobmode && inb>0 && g_oobenv!=NULL ) {
+            /* Threshold hit sets are nested, so an equal count means an
+               identical set, an identical buffer, and identical decodes:
+               skip the round rather than repeat it. */
+            float th=g_nbk*g_oobsig;
+            long nh=0, ii;
+            for(ii=0;ii<114L*12000L;ii++) if(g_oobenv[ii]>th) nh++;
+            if( nh==lastnh ) continue;
+            lastnh=nh;
+        }
         npoints = readwavfile(ptr_to_infile, wspr_type, idat, qdat);
         if( npoints == 1 ) break;
       }
@@ -2311,6 +2388,8 @@ int main(int argc, char *argv[])
         fclose(fhash);
     }
     
+    free(g_rawbuf);
+    free(g_oobenv);
     free(hashtab);
     free(loctab);
     free(symbols);
