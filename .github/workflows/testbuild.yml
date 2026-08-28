@@ -1,0 +1,145 @@
+name: Test build (PR #1)
+
+# Builds installable artifacts for an unmerged branch and publishes them as a
+# GitHub pre-release, so PR #1 can be field tested before anyone decides to
+# merge it. A GitHub Release only needs a tag, and a tag can point at any
+# commit, so nothing here touches master.
+#
+# Deliberately narrower than release.yml: Windows x64, Linux x64 and Linux
+# ARM64 only, no macOS, and no mirror push to the public repo. The tag is
+# recreated on every run so there is exactly one current test build.
+
+on:
+  push:
+    branches: ["testbuild/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: testbuild-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Filename version for the installers. Not a real release version: it exists
+  # so a tester can tell these apart from a stock 3.0.2 build at a glance.
+  BUILD_VERSION: "3.0.2-pr1"
+  RELEASE_TAG: "pr1-test"
+
+jobs:
+  linux:
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      version: "3.0.2-pr1"
+      hamlib_branch: "4.7.1"
+      arch: "x86_64"
+
+  linux-arm:
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      version: "3.0.2-pr1"
+      hamlib_branch: "4.7.1"
+      arch: "aarch64"
+
+  windows:
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      version: "3.0.2-pr1"
+      hamlib_branch: "4.7.1"
+
+  release:
+    needs: [linux, linux-arm, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      # A build job can exit 0 without having packaged anything (a step behind
+      # an if: that evaluated false, an upload that matched no files). Check
+      # for the installers themselves before publishing, so a partial release
+      # never reaches the download page.
+      - name: Verify installer artifacts
+        run: |
+          shopt -s nullglob
+          labels=(
+            "Windows x64 installer"
+            "Linux x64 AppImage"
+            "Linux x64 .deb"
+            "Linux x64 .rpm"
+            "Linux ARM64 AppImage"
+            "Linux ARM64 .deb"
+            "Linux ARM64 .rpm"
+          )
+          patterns=(
+            "artifacts/wsjtx-${BUILD_VERSION}-windows-x86_64-installer/*.exe"
+            "artifacts/wsjtx-${BUILD_VERSION}-linux-x86_64-AppImage/*.AppImage"
+            "artifacts/wsjtx-${BUILD_VERSION}-linux-x86_64-deb/*.deb"
+            "artifacts/wsjtx-${BUILD_VERSION}-linux-x86_64-rpm/*.rpm"
+            "artifacts/wsjtx-${BUILD_VERSION}-linux-aarch64-AppImage/*.AppImage"
+            "artifacts/wsjtx-${BUILD_VERSION}-linux-aarch64-deb/*.deb"
+            "artifacts/wsjtx-${BUILD_VERSION}-linux-aarch64-rpm/*.rpm"
+          )
+          missing=0
+          : > assets.txt
+          for i in "${!labels[@]}"; do
+            # shellcheck disable=SC2206 # word-split is intentional; nullglob makes it safe.
+            matches=( ${patterns[$i]} )
+            if [ ${#matches[@]} -eq 0 ]; then
+              echo "::error::MISSING  ${labels[$i]} - no match for ${patterns[$i]}"
+              missing=$((missing + 1))
+            else
+              for m in "${matches[@]}"; do
+                printf '  ok  %-24s %s (%s bytes)\n' "${labels[$i]}" "$m" "$(stat --printf '%s' "$m")"
+                echo "$m" >> assets.txt
+              done
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing artifact(s) missing - refusing to publish a partial test build."
+            exit 1
+          fi
+
+      - name: Checksums
+        run: |
+          mapfile -t files < assets.txt
+          sha256sum "${files[@]}" | sed 's#artifacts/[^/]*/##' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "SHA256SUMS.txt" >> assets.txt
+
+      - name: Write release notes
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          sed -e "s|@SHA@|${SHA}|g" -e "s|@VERSION@|${BUILD_VERSION}|g" \
+            .github/testbuild-notes.md > notes.md
+          cat notes.md
+
+      # Recreate the tag and release each run so there is one current test
+      # build rather than a pile of near-identical pre-releases. The tag is
+      # created at this commit; master is untouched.
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
+          mapfile -t files < assets.txt
+          gh release create "$RELEASE_TAG" \
+            --target "$SHA" \
+            --title "WSJT-X ${BUILD_VERSION} - PR #1 test build" \
+            --notes-file notes.md \
+            --prerelease \
+            "${files[@]}"
+          gh release view "$RELEASE_TAG" --json url --jq .url
