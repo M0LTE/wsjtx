@@ -1,3 +1,14 @@
+module osdwspr_boxes
+! The pattern boxes boxit fills and fetchit reads back.  These were a COMMON
+! block, but a threadprivate COMMON compiles to a common TLS symbol, which
+! gfortran emits as the .tls_common directive on Windows and the PE assembler
+! does not understand.  Module variables are ordinary definitions, so the same
+! per-thread storage assembles everywhere.  Nothing else changes: the two
+! routines share exactly the arrays they shared before.
+  integer :: indexes(4000,2), fp(0:525000), np(4000)
+!$omp threadprivate(indexes,fp,np)
+end module osdwspr_boxes
+
 subroutine osdwspr(ss,apmask,ndeep,cw,nhardmin,dmin)
 ! 
 use iso_c_binding
@@ -290,11 +301,9 @@ subroutine nextpat(mi,k,iorder,iflag)
 end subroutine nextpat
 
 subroutine boxit(reset,e2,ntau,npindex,i1,i2)
+  use osdwspr_boxes
   integer*1 e2(1:ntau)
-  integer   indexes(4000,2),fp(0:525000),np(4000)
   logical reset
-  common/boxes/indexes,fp,np
-!$omp threadprivate(/boxes/)
 
   if(reset) then
 ! fp is indexed by an ntau-bit pattern, so only the first 2**ntau entries are
@@ -327,13 +336,12 @@ subroutine boxit(reset,e2,ntau,npindex,i1,i2)
 end subroutine boxit
 
 subroutine fetchit(reset,e2,ntau,i1,i2)
-  integer   indexes(4000,2),fp(0:525000),np(4000)
+  use osdwspr_boxes
   integer   lastpat
   integer*1 e2(ntau)
   logical reset
-  common/boxes/indexes,fp,np
   save lastpat,inext
-!$omp threadprivate(/boxes/,lastpat,inext)
+!$omp threadprivate(lastpat,inext)
 
   if(reset) then
     lastpat=-1
