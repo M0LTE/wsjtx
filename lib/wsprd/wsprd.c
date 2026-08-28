@@ -79,6 +79,7 @@ float *g_oobenv=NULL;   /* magnitude of the out-of-band detection stream      */
 float  g_oobsig=0.0f;   /* its robust sigma                                   */
 int    g_oobmode=0;     /* 1 = sweep active: read once, reprocess thereafter  */
 float  g_nbk=0.0f;      /* blanking threshold in sigmas, 0 = no blanking      */
+int g_guard  = 0;     /* -G: gate bare type-2 Fano decodes on symbol agreement */
 int g_keepdt = 0;     /* 1 = an unpackable OSD result fails just that attempt,
                          instead of abandoning the remaining DT offsets       */
 float g_minsync1 = -1.0f; /* -S overrides for the sync gates; negative values */
@@ -1449,6 +1450,9 @@ void usage(void)
     printf("            2 = aggressive, a = sweep, or T1,T2,T3,W[,c] for raw thresholds\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
     printf("       -P n worker threads: 0 = one per logical processor (default), 1 = serial\n");
+    printf("       -G reject a bare prefixed-callsign message from the Fano path when\n");
+    printf("          it disagrees with more than 24 of the demodulated symbols, the\n");
+    printf("          signature of a wrong codeword; hash-verified results are exempt\n");
     printf("       -A after an unpackable OSD result keep trying the remaining DT\n");
     printf("          offsets, rather than abandoning them as stock wsprd does\n");
     printf("       -S s1,s2 override the sync gates: s1 admits candidates to the fine\n");
@@ -1527,6 +1531,8 @@ int main(int argc, char *argv[])
     hashtab=calloc(32768*13,sizeof(char));
     char *loctab;
     loctab=calloc(32768*5,sizeof(char));
+    char *hashsnap=calloc(32768*13,sizeof(char));
+    char *locsnap=calloc(32768*5,sizeof(char));
     int nh;
     symbols=calloc(nbits*2,sizeof(unsigned char));
     decdata=calloc(11,sizeof(unsigned char));
@@ -1564,7 +1570,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:ABcC:de:f:Hn:N:P:JmS:o:qstwvX:Y:z:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:ABcC:de:f:GHn:N:P:JmS:o:qstwvX:Y:z:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1580,6 +1586,9 @@ int main(int argc, char *argv[])
                 break;
             case 'A':
                 g_keepdt=1;
+                break;
+            case 'G':
+                g_guard=1;
                 break;
             case 'S':
                 sscanf(optarg,"%f,%f",&g_minsync1,&g_minsync2);
@@ -2244,11 +2253,28 @@ int main(int argc, char *argv[])
                 // Unpack the decoded message, update the hashtable, apply
                 // sanity checks on grid and power, and return
                 // call_loc_pow string and also callsign (for de-duping).
+                if( g_guard ) {
+                    memcpy(hashsnap,hashtab,32768*13);
+                    memcpy(locsnap,loctab,32768*5);
+                }
                 noprint=unpk_(message,hashtab,loctab,call_loc_pow,callsign);
                 if( subtraction && !noprint ) {
                     if( get_wspr_channel_symbols(call_loc_pow, hashtab, loctab, channel_symbols) ) {
-                        subtract_signal2(idat, qdat, npoints, f1, shift1, drift1, channel_symbols);
                         if(!osd_decode) nhardmin=count_hard_errors(symbols,channel_symbols);
+                        if( g_guard && !osd_decode && nhardmin>24 &&
+                            strchr(call_loc_pow,'/')!=NULL && call_loc_pow[0]!='<' ) {
+                            /* A bare type 2 from Fano that disagrees with a
+                               third of the demodulated symbols: the signature
+                               of an accepted wrong codeword.  Do not subtract
+                               a signal that is not there, do not print it, and
+                               put the hash table back the way it was, so the
+                               fabricated call cannot vouch for itself through
+                               the hash-gated deep search on a later pass. */
+                            memcpy(hashtab,hashsnap,32768*13);
+                            memcpy(loctab,locsnap,32768*5);
+                            continue;
+                        }
+                        subtract_signal2(idat, qdat, npoints, f1, shift1, drift1, channel_symbols);
                     } else {
                         break;
                     }
