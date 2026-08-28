@@ -6,8 +6,7 @@ name: Test build (PR #1)
 # commit, so nothing here touches master.
 #
 # Deliberately narrower than release.yml: Windows x64, Linux x64 and Linux
-# ARM64 only, no macOS, and no mirror push to the public repo. The tag is
-# recreated on every run so there is exactly one current test build.
+# ARM64 only, no macOS, and no mirror push to the public repo.
 
 on:
   push:
@@ -21,38 +20,70 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # Filename version for the installers. Not a real release version: it exists
-  # so a tester can tell these apart from a stock 3.0.2 build at a glance.
-  BUILD_VERSION: "3.0.2-pr1"
-  RELEASE_TAG: "pr1-test"
-
 jobs:
+  # The version is upstream's, from CMakeLists.txt, plus -m0lte and the short
+  # commit. Upstream's part says which WSJT-X this is; -m0lte says it is not
+  # upstream's build; the commit says exactly which one, so two test builds a
+  # day apart can be told apart from the filename alone. The same string goes
+  # into the binary, so Help > About and the title bar agree with the file the
+  # tester downloaded.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      suffix: ${{ steps.v.outputs.suffix }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: v
+        run: |
+          BASE=$(grep -E '^\s*VERSION\s+[0-9]' CMakeLists.txt | head -1 | awk '{print $2}' | cut -d. -f1-3)
+          if [ -z "$BASE" ]; then
+            echo "::error::Could not derive VERSION from CMakeLists.txt"
+            exit 1
+          fi
+          SUFFIX="-m0lte-${GITHUB_SHA:0:7}"
+          {
+            echo "version=${BASE}${SUFFIX}"
+            echo "suffix=${SUFFIX}"
+            echo "tag=v${BASE}${SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${BASE}${SUFFIX}"
+
   linux:
+    needs: prepare
     uses: ./.github/workflows/build-linux.yml
     with:
-      version: "3.0.2-pr1"
+      version: ${{ needs.prepare.outputs.version }}
+      version_suffix: ${{ needs.prepare.outputs.suffix }}
       hamlib_branch: "4.7.1"
       arch: "x86_64"
 
   linux-arm:
+    needs: prepare
     uses: ./.github/workflows/build-linux.yml
     with:
-      version: "3.0.2-pr1"
+      version: ${{ needs.prepare.outputs.version }}
+      version_suffix: ${{ needs.prepare.outputs.suffix }}
       hamlib_branch: "4.7.1"
       arch: "aarch64"
 
   windows:
+    needs: prepare
     uses: ./.github/workflows/build-windows.yml
     with:
-      version: "3.0.2-pr1"
+      version: ${{ needs.prepare.outputs.version }}
+      version_suffix: ${{ needs.prepare.outputs.suffix }}
       hamlib_branch: "4.7.1"
 
   release:
-    needs: [linux, linux-arm, windows]
+    needs: [prepare, linux, linux-arm, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -126,9 +157,9 @@ jobs:
             .github/testbuild-notes.md > notes.md
           cat notes.md
 
-      # Recreate the tag and release each run so there is one current test
-      # build rather than a pile of near-identical pre-releases. The tag is
-      # created at this commit; master is untouched.
+      # The tag is created here, at this commit, by gh. master is not involved.
+      # Deleting first makes a re-run of the same commit idempotent rather than
+      # a failure; a different commit gets a different tag and its own release.
       - name: Publish pre-release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,8 +169,8 @@ jobs:
           mapfile -t files < assets.txt
           gh release create "$RELEASE_TAG" \
             --target "$SHA" \
-            --title "WSJT-X ${BUILD_VERSION} - PR #1 test build" \
+            --title "WSJT-X ${BUILD_VERSION} (PR #1 test build)" \
             --notes-file notes.md \
             --prerelease \
             "${files[@]}"
-          gh release view "$RELEASE_TAG" --json url --jq .url
+          echo "Published: $(gh release view "$RELEASE_TAG" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
