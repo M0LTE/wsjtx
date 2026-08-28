@@ -14,9 +14,13 @@ The AppImages are the portable option: `chmod +x` the file and run it. Nothing i
 
 Help > About reports `@VERSION@`, so a report against this build can be told apart from one against stock 3.0.2 or against a later test build.
 
-## Not identical to the PR
+## Relationship to the PR
 
-The branch as submitted does not compile on Windows. It makes the OSD pattern boxes per-thread with `!$omp threadprivate` on a COMMON block, and gfortran emits that as a common TLS symbol, which the assembler used on Windows has no directive for. This build holds those arrays in a module instead: same three arrays, same per-thread storage, and it assembles on all three platforms. Linux binaries are otherwise the PR's code.
+The branch as originally submitted did not compile on Windows: it made the OSD pattern boxes per-thread with `!$omp threadprivate` on a COMMON block, and gfortran emits that as a common TLS symbol, which the assembler used on Windows has no directive for. Those arrays now live in a module instead, which assembles everywhere and was separately confirmed to produce byte-identical decodes (stdout and ALL_WSPR.TXT, deep search included) against the previously validated binary over off-air corpus slots at full Max depth.
+
+That fix is now part of PR #1 itself, so the decoder in these installers is the PR's code. The only thing here that is not in the PR is the build plumbing: the workflow that produces these files, and the version suffix that puts `@VERSION@` in the title bar.
+
+One thing to keep in mind when reading the PR evidence: every off-air number quoted there was produced by binaries built before that fix.
 
 ## Known limitations
 
