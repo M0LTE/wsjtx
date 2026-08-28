@@ -2535,7 +2535,7 @@ void MainWindow::dataSink(qint64 frames)
       //candidate rather than only those already above the gate
       if((m_ndepth&7)==4) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "20"
                                      << "-n" << "a" << "-X" << "1" << "-A"
-                                     << "-S" << "0,-1" << "-Y" << "4";
+                                     << "-S" << "0,-1" << "-Y" << "4" << "-G";
       m_cmndP1.clear ();
       if(m_diskData) {
         m_cmndP1 << depth_args << "-a"
