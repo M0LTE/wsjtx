@@ -79,6 +79,17 @@ float *g_oobenv=NULL;   /* magnitude of the out-of-band detection stream      */
 float  g_oobsig=0.0f;   /* its robust sigma                                   */
 int    g_oobmode=0;     /* 1 = sweep active: read once, reprocess thereafter  */
 float  g_nbk=0.0f;      /* blanking threshold in sigmas, 0 = no blanking      */
+int g_recall = 0;     /* -r: remember recent decodes, search there again     */
+
+/* minutes on a linear scale good enough to age priors within a year */
+static long rv_minutes(int yy,int mo,int dd,int hh,int mn)
+{
+    static const int cum[12]={0,31,59,90,120,151,181,212,243,273,304,334};
+    long days = yy*365L + yy/4 + cum[mo-1] + dd;
+    if( (yy%4)==0 && mo<=2 ) days--;
+    return days*1440L + hh*60L + mn;
+}
+
 int g_guard  = 0;     /* -G: gate bare type-2 Fano decodes on symbol agreement */
 int g_keepdt = 0;     /* 1 = an unpackable OSD result fails just that attempt,
                          instead of abandoning the remaining DT offsets       */
@@ -1450,6 +1461,8 @@ void usage(void)
     printf("            2 = aggressive, a = sweep, or T1,T2,T3,W[,c] for raw thresholds\n");
     printf("       -o n (0<=n<=5), decoding depth for OSD, default is disabled\n");
     printf("       -P n worker threads: 0 = one per logical processor (default), 1 = serial\n");
+    printf("       -r remember where stations were decoded for half an hour, and at\n");
+    printf("          full depth try those frequencies even without a candidate\n");
     printf("       -G reject a bare prefixed-callsign message from the Fano path when\n");
     printf("          it disagrees with more than 24 of the demodulated symbols, the\n");
     printf("          signature of a wrong codeword; hash-verified results are exempt\n");
@@ -1482,7 +1495,7 @@ int main(int argc, char *argv[])
     char *ptr_to_infile,*ptr_to_infile_suffix;
     char *data_dir=".";
     char wisdom_fname[200],all_fname[200],spots_fname[200];
-    char timer_fname[200],hash_fname[200];
+    char timer_fname[200],hash_fname[200],rv_fname[220];
     char uttime[5],date[7];
     int c,delta,maxpts=65536,verbose=0,quickmode=0,more_candidates=0, stackdecoder=0;
     int usehashtable=1,wspr_type=2, ipass, nblocksize;
@@ -1517,7 +1530,7 @@ int main(int argc, char *argv[])
     float ttrials=0.0, twall=0.0;
     double wt0, wtstart=wsecs();
     
-    struct cand { float freq; float snr; int shift; float drift; float sync; };
+    struct cand { float freq; float snr; int shift; float drift; float sync; int prior; };
     struct cand candidates[200];
 #define MAXUNIQUE 50
     
@@ -1546,6 +1559,12 @@ int main(int argc, char *argv[])
     memset(allcalls,0,sizeof(char)*100*13);
     
     int uniques=0, noprint=0, ndecodes_pass=0;
+
+#define RVMAX 60
+#define RVAGE 30
+    struct rvprior { char rdate[7]; char rtime[5]; float freq, dtv, drift; int stale; };
+    struct rvprior rvp[RVMAX];
+    int nrv=0;
     
     // Parameters used for performance-tuning:
     unsigned int maxcycles=10000;            //Decoder timeout limit
@@ -1570,7 +1589,7 @@ int main(int argc, char *argv[])
     idat=calloc(maxpts,sizeof(float));
     qdat=calloc(maxpts,sizeof(float));
     
-    while ( (c = getopt(argc, argv, "a:ABcC:de:f:GHn:N:P:JmS:o:qstwvX:Y:z:")) !=-1 ) {
+    while ( (c = getopt(argc, argv, "a:ABcC:de:f:GHn:N:P:JmrS:o:qstwvX:Y:z:")) !=-1 ) {
         switch (c) {
             case 'a':
                 data_dir = optarg;
@@ -1589,6 +1608,9 @@ int main(int argc, char *argv[])
                 break;
             case 'G':
                 g_guard=1;
+                break;
+            case 'r':
+                g_recall=1;
                 break;
             case 'S':
                 sscanf(optarg,"%f,%f",&g_minsync1,&g_minsync2);
@@ -1720,6 +1742,7 @@ int main(int argc, char *argv[])
     strncat(spots_fname,"/wspr_spots.txt",20);
     strncat(timer_fname,"/wspr_timer.out",20);
     strncat(hash_fname,"/hashtable.txt",20);
+    snprintf(rv_fname,sizeof rv_fname,"%s/wspr_priors.txt",data_dir);
     if ((fp_fftwf_wisdom_file = fopen(wisdom_fname, "r"))) {  //Open FFTW wisdom
         fftwf_import_wisdom_from_file(fp_fftwf_wisdom_file);
         fclose(fp_fftwf_wisdom_file);
@@ -1798,6 +1821,41 @@ int main(int argc, char *argv[])
         fclose(fhash);
     }
     
+    if( g_recall && wspr_type==2 ) {
+        FILE *frv=fopen(rv_fname,"r");
+        if( frv ) {
+            char line[160], rdate[16], rtime[16];
+            double rdial, rfo, rdt, rdrift;
+            int yy,mo,dd,hh,mn;
+            long now=0;
+            if( sscanf(date,"%2d%2d%2d",&yy,&mo,&dd)==3 &&
+                sscanf(uttime,"%2d%2d",&hh,&mn)==2 )
+                now=rv_minutes(yy,mo,dd,hh,mn);
+            while( fgets(line,sizeof line,frv) && nrv<RVMAX ) {
+                if( sscanf(line,"%15s %15s %lf %lf %lf %lf",
+                           rdate,rtime,&rdial,&rfo,&rdt,&rdrift) != 6 ) continue;
+                if( fabs(rdial-dialfreq) > 1.0e-4 ) continue;   /* other band */
+                if( sscanf(rdate,"%2d%2d%2d",&yy,&mo,&dd)!=3 ) continue;
+                if( sscanf(rtime,"%2d%2d",&hh,&mn)!=2 ) continue;
+                if( strlen(rdate)!=6 || strlen(rtime)!=4 ) continue;
+                long tmin=rv_minutes(yy,mo,dd,hh,mn);
+                if( now - tmin > RVAGE || now - tmin < 0 ) continue;
+                int dupe=0;
+                for (i=0; i<nrv; i++)
+                    if( fabsf(rvp[i].freq-(float)rfo) < 0.2f ) { dupe=1; break; }
+                if( dupe ) continue;
+                strcpy(rvp[nrv].rdate,rdate);
+                strcpy(rvp[nrv].rtime,rtime);
+                rvp[nrv].freq=(float)rfo;
+                rvp[nrv].dtv=(float)rdt;
+                rvp[nrv].drift=(float)rdrift;
+                rvp[nrv].stale=0;
+                nrv++;
+            }
+            fclose(frv);
+        }
+    }
+
     // Compute corrected fmin, fmax, accounting for dial frequency error.  This
     // belongs outside the pass loop: applied once per pass, three passes moved
     // the search window by three times the error.
@@ -1932,6 +1990,7 @@ int main(int argc, char *argv[])
             candidates[i].drift=0.0;
             candidates[i].shift=0;
             candidates[i].sync=0.0;
+            candidates[i].prior=0;
         }
         
         int npk=0;
@@ -2147,6 +2206,30 @@ int main(int argc, char *argv[])
                 nwat++;
             }
         }
+
+        /* Return-visitor recall: a station decoded in the last half hour is
+           usually still there, so at full depth its last known frequency and
+           DT get a decode attempt even when candidate detection offers
+           nothing.  Acceptance is unchanged: the attempt still has to satisfy
+           Fano or the hash-gated OSD, so this is only extra search, aimed
+           where stations are known to live. */
+        if( g_recall && wspr_type==2 && ipass==2 ) {
+            for (j=0; j<nrv && j<20 && nwat<200; j++) {
+                int nearby=0;
+                for (k=0; k<nwat && !nearby; k++)
+                    if( fabsf(candidates[k].freq - rvp[j].freq) < 0.5f ) nearby=1;
+                for (k=0; k<uniques && !nearby; k++)
+                    if( fabsf(allfreqs[k] - rvp[j].freq) < 0.5f ) nearby=1;
+                if( nearby ) continue;
+                candidates[nwat].freq=rvp[j].freq;
+                candidates[nwat].snr=-33.0;
+                candidates[nwat].shift=(int)(375.0f*(1.0f+rvp[j].dtv));
+                candidates[nwat].drift=rvp[j].drift;
+                candidates[nwat].sync=1.0f;
+                candidates[nwat].prior=1;
+                nwat++;
+            }
+        }
         
         struct dec_ctx ctx;
         ctx.idat=idat; ctx.qdat=qdat; ctx.npoints=npoints;
@@ -2183,7 +2266,7 @@ int main(int argc, char *argv[])
                and the offsets, of which there are up to 129, run in parallel
                and keep the lowest-numbered attempt that reached either
                outcome.  That is the attempt stock would have stopped at. */
-            int nidt = quickmode ? 1 : (128/iifac + 1);
+            int nidt = quickmode ? 1 : (candidates[j].prior ? 5 : (128/iifac + 1));
             int found = 0;
             struct trial_result best;
             best.decoded = 0;
@@ -2220,7 +2303,17 @@ int main(int argc, char *argv[])
                         { if( td < firstev ) { firstev = td; evr = r; } }
                     }
                 }
-                if( firstev < nidt && evr.decoded ) { found = 1; best = evr; }
+                if( firstev < nidt && evr.decoded ) {
+                    if( candidates[j].prior && !evr.osd_decode ) {
+                        /* an injected prior may only decode through the
+                           hash-gated deep search: the station it claims to be
+                           is in the table, and a bare Fano accept here is the
+                           wrong-codeword channel */
+                        ;
+                    } else {
+                        found = 1; best = evr;
+                    }
+                }
             }
             ttrials += (float)(wsecs()-wt0);
             if( found ) {
@@ -2404,6 +2497,32 @@ int main(int argc, char *argv[])
     fftwf_destroy_plan(PLAN2);
     fftwf_destroy_plan(PLAN3);
     
+    if( g_recall && wspr_type==2 ) {
+        for (i=0; i<uniques; i++) {
+            double fo=(decodes[i].freq - dialfreq)*1.0e6 - 1500.0;
+            for (j=0; j<nrv; j++)
+                if( fabsf(rvp[j].freq-(float)fo) < 0.2f ) rvp[j].stale=1;
+        }
+        FILE *frv=fopen(rv_fname,"w");
+        if( frv ) {
+            int nout=0;
+            for (i=0; i<uniques && nout<RVMAX; i++) {
+                double fo=(decodes[i].freq - dialfreq)*1.0e6 - 1500.0;
+                fprintf(frv,"%6s %4s %11.6f %8.2f %6.2f %5.1f\n",
+                        date, uttime, dialfreq, fo, decodes[i].dt, decodes[i].drift);
+                nout++;
+            }
+            for (j=0; j<nrv && nout<RVMAX; j++) {
+                if( rvp[j].stale ) continue;
+                fprintf(frv,"%6s %4s %11.6f %8.2f %6.2f %5.1f\n",
+                        rvp[j].rdate, rvp[j].rtime, dialfreq, rvp[j].freq,
+                        rvp[j].dtv, rvp[j].drift);
+                nout++;
+            }
+            fclose(frv);
+        }
+    }
+
     if( usehashtable ) {
         fhash=fopen(hash_fname,"w");
         for (i=0; i<32768; i++) {
