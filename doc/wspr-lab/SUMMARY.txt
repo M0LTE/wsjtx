@@ -1,0 +1,194 @@
+run                        args                             chan       sta     SNR50       dec/tx  false  s/file
+COHERENT DEMODULATION  (stock -C 500 -o 4 -d   vs   the same plus -N 14)
+channel                         stock      new     gain   false         s/file
+AWGN, stable path              -30.90   -32.30    1.40dB   0->0    0.25 ->  0.43
+Rayleigh, 0.1 Hz spread        -29.20   -29.85    0.65dB   0->0    0.33 ->  0.83
+Rayleigh, 1.0 Hz spread        -26.30   -26.30    0.00dB   0->0    0.17 ->  0.42
+
+NOISE BLANKER  (-n a: sweep 0,3,6,10,15,20% and keep every decode any setting finds)
+heavy impulsive QRN            -24.40   -31.80    7.40dB   0->0    0.17 ->  1.14
+clean gaussian noise           -32.30   -32.35    0.05dB   0->0    0.40 ->  1.04
+  (a FIXED 10% blanker)        -32.30   -29.65   -2.65dB   <- why a fixed setting is wrong
+
+BUSY SUB-BAND, 25 signals per file, total spots recovered
+clean                         4190/5000  ->  4644/5000   (+9.1 points, +11% more spots)    4.61 ->  8.12 s/file
+with heavy QRN                1401/3000  ->  2656/3000   (+41.8 points, +90% more spots)    3.30 -> 32.55 s/file
+
+THINGS THAT DID NOT WORK  (measured and rejected)
+more Fano cycles, -C 10000        -30.95 ->  -31.25 (+0.30 dB)   4 false decodes in 3500 files
+more Fano cycles, -C 100000       -30.95 ->  -31.45 (+0.50 dB)   41 false decodes in 3500 files
+read 120 s instead of 114 s       -32.20 ->  -32.20 (+0.00 dB)   even with DT spread over -1.5..+5 s
+subtract at the jittered shift   busy band: 4190 -> 4190 decodes, no change
+
+THE OSD HASH-TABLE GATE  (why deep search only helps stations you already heard)
+  callsign NOT in hashtable.txt: -30.95 dB
+  callsign already known:        -31.85 dB   (0.90 dB of OSD, unavailable to new stations)
+  known + deep OSD (-C 10000 -o 5): -32.05 dB  -- still worse than coherent demod at -32.30
+
+coherent demodulation   (12 busy sub-band files, worst case per file)
+ threads    mean s   worst s   speedup  decodes
+       1      5.39      7.43      1.00x      271
+       4      1.50      2.07      3.59x      271
+       8      0.87      1.21      6.22x      271
+      12      0.80      1.05      6.75x      271
+      16      0.94      1.26      5.71x      271
+
+coherent + auto noise blanker   (12 busy sub-band files, worst case per file)
+ threads    mean s   worst s   speedup  decodes
+       1     23.16     27.70      1.00x      280
+       4      6.55      7.69      3.53x      280
+       8      3.88      4.60      5.97x      280
+      12      3.54      4.10      6.54x      280
+      16      4.67      5.95      4.96x      280
+
+THREADING CORRECTNESS
+  sample file, -P 1/2/4/6/8/12/16                identical output at every count
+  80 busy sub-band files, -P 1 vs -P 8           1730 decodes, 0 mismatches
+  40 busy sub-band files, -P 1 vs -P 16           859 decodes, 0 mismatches
+  2500 files with OSD disabled, threaded -P 1 vs sequential build
+                                                 identical decode counts at every SNR
+  real sample, stock arguments                   byte-identical to stock wsprd
+
+  With OSD enabled the threaded build finds slightly MORE decodes than the
+  sequential one (3074 vs 3041 of 4800, -32.35 vs -32.30 dB).  That is not a
+  race: stock wsprd breaks out of the entire jitter loop when an OSD result
+  fails to unpack, silently abandoning the remaining DT offsets for that
+  demodulator setting.  Treating it as one failed attempt is both the correct
+  behaviour and what makes the grid parallelisable.
+
+===========================================================================
+SPENDING THE FULL 2-MINUTE BUDGET
+===========================================================================
+
+Recording is nearly free, so the real budget is not the ~6 s gap before the next
+transmission but most of the next receive period: roughly 100 s x 8 cores, about
+200x what the decoder currently uses.  The question is what that buys.
+
+JOINT CHANNEL-AND-DATA SCORING  (tools/glrt.c.inc, src/wsprd-glrt)
+
+The idea: hand the decoder a long list of candidate codewords and pick between
+them with a statistic it did not optimise.  For each candidate, estimate the
+channel FROM that candidate and measure how coherently the data lines up.  The
+right codeword gives a clean channel estimate; a wrong one estimates the channel
+partly from noise.  Scoring one candidate costs ~500 operations once the
+per-tone correlations exist, so a list of thousands is affordable.
+
+Measured over 4141 coherent trials at -31 to -34 dB, logging the score of the
+TRUE codeword and of the one OSD actually returned:
+
+  OSD returned the truth        626 trials   score p5=13.8  p50=16.0
+  OSD returned something else  3515 trials   score p5= 6.3  p50= 8.8  max=17.4
+  the true codeword outscores OSD's wrong one in only 5.7% of those
+
+REFUTED, and the reason matters.  Splitting the wrong-codeword cases by how
+wrong they are:
+
+  60+ symbols wrong   n=2919   true scores 2.9,  OSD's noise fit scores 8.5
+  40..59 wrong        n= 591   true scores 12.2, OSD's       scores 12.7
+
+The first group is the decoder chewing on noise at parameters where no signal
+exists; the true codeword correctly scores nothing there.  The second group is
+the killer: at the right parameters, a codeword ~50 symbols from the truth fits
+the noisy data slightly BETTER than the truth does.  That is what operating at
+the code's limit without a CRC means, and no amount of search fixes it.
+
+As an acceptance test the ROC has no usable operating point: threshold 17 keeps
+only 22% of correct OSD finds and still admits 1 in 3515 wrong ones, which is
+about one bad spot per 240 files.  Worse in deployment, because taking the best
+score over a large trial grid pushes the proposed value into the extreme tail.
+
+CONCLUSION.  Extra compute buys more SEARCH, and search only helps where
+acceptance is already safe.  For a callsign already in the hash table that is
+true, and more search does help.  For a new callsign the binding constraint is
+WSPR's 50-bit message with no CRC, not CPU.  The 0.90 dB that OSD gives known
+stations cannot be extended to unknown ones by any single-decode statistic
+tested here.
+
+WHAT DOES SCALE WITH COMPUTE
+  - the blanker sweep, finer and wider
+  - more demodulator trials (these use the normal, safe acceptance)
+  - more subtraction passes on crowded bands
+  - deeper OSD for known callsigns, where the hash gate is a strong check
+
+CPU OPTIMISATIONS (bit-identical output, verified against the branch tip at
+-P 1, -P 8 and -P 16 with the full stack)
+
+  stage                     before    after
+  coarse DT/freq/drift      0.32 s    0.17 s     square roots taken once per bin
+  sync refinement           0.67 s    0.36 s     tone tables built once per symbol
+  whole decode, 1 worker    7.82 s    7.21 s     -7.8%
+  whole decode, 8 workers   2.20 s    2.09 s     -5.0%
+
+The coarse search gained less than the call count suggested because gcc at -O3
+was already vectorising those square roots.  The sync refinement halving is as
+predicted: the tone tables are only rebuilt per symbol when drift is non-zero,
+which is passes one and two.
+
+A-PRIORI DETECTION OF KNOWN STATIONS  (src/wsprd-ap, research build)
+
+With a realistic prior -- frequency to +/-0.1 Hz and DT to +/-0.15 s, both from
+the last time the station was decoded -- and 30 known stations tested, each only
+near its own frequency:
+
+  threshold 14: one false spot per 26 hours per band, 63.6% detection at -34 dB
+  50% detection lands near -34.3 dB, against a -32.35 dB decode threshold
+
+so about 2 dB, on top of the 1.4 dB already committed.  Longer coherent
+integration adds little: 55 s of smoothing instead of 18 s moved -34 detection
+from 63.6% to 70.0%.
+
+CAVEATS, both measured rather than assumed:
+  - stable paths only.  On Rayleigh fading with 0.1 Hz spread the detector gives
+    23% at -30 dB against a -29.85 dB decode threshold, i.e. nothing.  Same
+    constraint as the coherent demodulator: the channel has to hold still.
+  - known stations only.  It does nothing for new DX, which is what people chase.
+  - the gain is set by how many hypotheses are searched, so it depends on
+    testing only recently-active stations rather than everything ever heard.
+
+===========================================================================
+ROUND TWO, 2026-08-27  (see results/next/NOTES.md for the full write-up)
+===========================================================================
+Three additions measured against the branch tip and shipped as the new Deeper
+argument set (-N 20 -S 0,-1 -Y 4 added):
+  fade-weighted retries (-N 15..20)   +15% decodes (+0.35 dB) at threshold on
+                                      slow fading, additive-only by design
+  open refinement gate (-S 0,-1)      +13% decodes (+0.15 dB) at threshold
+  a fourth pass (-Y 4)                +90 spots per 10000 tx on a crowded band
+Off-air, 177 slots per band, spots checked against the global logs:
+  20 m  3654 -> 3680 (+31/-4)   30 m  2612 -> 2642 (+31/-2)   0 fabrications
+Rejected: finer DT jitter (-j 4): most single-knob spots off-air but produced
+the campaign's only fabricated callsign; the combo matches it without that.
+
+===========================================================================
+ROUND THREE, 2026-08-28  (results/next/NOTES.md)
+===========================================================================
+The -n a sweep was fabricating callsigns on clean crowded bands (blanking the
+strongest samples mutilates the signals themselves).  Rebuilt: impulses are
+detected on everything outside 1200..1800 Hz, which they dominate and WSPR
+signals cannot reach, and the raw samples are blanked at full resolution only
+where that detector fires, sweeping the threshold instead of a percentage.
+Plus -G: bare type-2 Fano decodes with >24 hard symbol errors are rejected
+with their hash-table plantings undone (the class wrong codewords land in).
+  QRN sim   -31.75 -> -32.15 (0.40 dB better than the old sweep), 0 false
+  clean sim  620 -> 661 /1500 at threshold, 0 false
+  off-air   20 m 3705 -> 3737 corroborated, 7 -> 0 uncorroborated
+            30 m 2657 -> 2671 corroborated, 4 -> 0 uncorroborated
+In flight: -r return-visitor recall, about 2 dB deeper for stations heard in
+the last half hour (sim: 50% at -35.1 vs -33.1; 0 false in 1000 warm noise
+files); off-air validation running.
+Landed later the same day: -r return-visitor recall (4655fd961, c8255484a).
+Injected priors accept only through the hash-gated deep search; sim 50% at
+-35.1 dB for stations heard in the last half hour vs -33.1 without; zero
+false decodes in 1800 warm-prior noise files; off-air +1 (20m) and +4 (30m)
+corroborated with zero fabrications.  Max = -C 500 -o 4 -d -N 20 -n a -X 1
+-A -S 0,-1 -Y 4 -G -r.
+
+THE FANO BUDGET, REVISITED (2026-08-29, results/cfano/NOTES.md)
+Can acceptance-side gating buy back a bigger -C?  No, twice: false accepts and
+marginal real decodes at -C 10000/50000 are statistically the same population
+(best zero-false cut keeps 2.3% of the gain, 1296 real vs 94 false events,
+9600 paired trials), and hash-gated escalation (-E 50000) on top of full Max
+adds 1 decode in 1200 known-station trials because OSD plus recall already
+saturate the gated deep search.  Also new: -C 50000 LOSES real decodes at
+easier SNRs through wrong-accept subtraction damage.  -C 500 confirmed clean
+at scale: 0 false in 9600 trials.  -C 500 stays.
