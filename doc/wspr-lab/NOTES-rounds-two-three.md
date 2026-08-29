@@ -410,3 +410,23 @@ not a threshold.
 
 The -G guard itself generalized: zero bare type-2 fabrications on any of the
 four unseen bands.
+
+
+## Wall clock: Max against Deep (2026-08-29 evening)
+
+Measured on the idle 12-thread hyperv-gha box, strictly sequentially, one file
+at a time, same branch binary for both arms, default worker count, 40 slots in
+time order per corpus.  Raw per-file times: results/next/bench_maxdeep.json.
+
+    corpus              Deep mean/worst      Max mean/worst      spots
+    20 m day, busy      0.63 / 0.85 s       34.6 / 49.5 s       636 -> 673
+    40 m night, busy    0.91 / 1.17 s       43.6 / 62.2 s       786 -> 821
+    30 m night          0.30 / 0.50 s       19.7 / 33.8 s       281 -> 297
+
+Max costs roughly 50x Deep and buys 4.5 to 5.8% more spots even in these
+40-slot samples.  The worst case, 62 s on the crowded night 40 m band, fits
+the roughly 110 s budget on this 12-thread machine with modest headroom; on
+substantially slower hardware a busy band would not finish in time, which is
+why the user guide says Max is for receivers with processing power to spare.
+The blanker sweep is the dominant multiplier; -P caps the threads if the box
+is shared.
