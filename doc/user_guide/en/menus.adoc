@@ -178,7 +178,11 @@ options. *Deep* usually provides the best sensitivity, at the cost
 of slower processing and a slightly higher probability of false
 decodes.
 
-WSPR mode additionally offers *Max*, which enables everything the
+WSPR mode additionally offers *Deeper* and *Max*.  *Deeper* enables
+everything *Max* does except the automatic noise blanker sweep, at
+roughly a sixth of the processing time, and is intended for
+multi-band and skimmer use where several bands must each be decoded
+within every two-minute cycle.  *Max* enables everything the
 WSPR decoder has: coherent demodulation, fade-weighted retries, an
 automatic noise blanker aimed by an out-of-band impulse detector,
 narrowband interference excision, an extra subtraction pass, sync

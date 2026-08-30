@@ -430,3 +430,35 @@ substantially slower hardware a busy band would not finish in time, which is
 why the user guide says Max is for receivers with processing power to spare.
 The blanker sweep is the dominant multiplier; -P caps the threads if the box
 is shared.
+
+
+## Deeper (2026-08-30)
+
+PR review criticism: Max's wall clock (roughly 50x Deep) is impractical for a
+multi-band skimmer.  Answer: a middle depth.  A gated sweep (-n g, skip
+blanker rounds blanking under 1e-4 of samples) was built and REJECTED on
+measurement: the out-of-band envelope of real HF keeps 4 to 5 of 5 rounds
+above any sensible floor on every corpus (surviving-round means at floor
+1e-4: 20m 4.5, 40m 4.9, 80m 4.8, 160m 4.8, 30m-night 2.8), so hit-gating
+never creates a cost tier.  Deeper is therefore simply Max minus the sweep:
+-C 500 -o 4 -d -N 20 -X 1 -A -S 0,-1 -Y 4 -G -r.
+
+Also landed, unconditional and output-identical (verified byte-for-byte under
+full Max arguments): extra passes stop when a pass decodes nothing, since the
+buffers are then provably unchanged.
+
+Wall clock, idle hyperv-gha, strictly sequential, 40 slots each; and
+full-corpus corroborated spots:
+
+    corpus        Deep mean   Deeper mean/p95   Max mean     stock/Deeper/Max spots
+    20 m day      0.63 s      5.48 / 7.34 s     33.5 s       3569 / 3653 / 3738
+    40 m night    0.90 s      7.69 / 9.76 s     43.8 s       3278 / 3371 / 3477
+    30 m night    0.30 s      3.02 / 4.57 s     17.5 s        915 /  967 /  997
+
+Deeper keeps about half of Max's advantage at about a sixth of its cost, with
+no new fabrication behaviour (its only 40 m suspect is the known shared
+residual; the 30 m unknowns are the real local station).  Cross-day bench
+stability: Deep and Max rows reproduce within 2 to 3% of the previous day's
+benchmark on the same box.
+
+Deeper landed as depth 5 in the UI (commits 7c366e841, dd09aa1c0).
