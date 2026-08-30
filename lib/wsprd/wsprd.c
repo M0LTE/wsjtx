@@ -1892,6 +1892,11 @@ int main(int argc, char *argv[])
     //*************** main loop starts here *****************
     for (ipass=0; ipass<npasses; ipass++) {
         if(ipass==1 && ndecodes_pass == 0 && npasses>2) ipass=2;
+        /* An extra pass exists to search what new subtraction has uncovered.
+           If the previous full-depth pass decoded nothing, nothing was
+           subtracted, the buffers are identical, and the next pass would
+           provably repeat the same failures: stop. */
+        if(ipass>=3 && ndecodes_pass == 0) break;
         if(ipass < 2) {
             nblocksize=1;
             maxdrift=4;
