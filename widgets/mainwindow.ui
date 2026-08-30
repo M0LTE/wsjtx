@@ -4848,6 +4848,7 @@ QPushButton[state=&quot;ok&quot;] {
     <addaction name="actionQuickDecode"/>
     <addaction name="actionMediumDecode"/>
     <addaction name="actionDeepestDecode"/>
+    <addaction name="actionDeeperDecode"/>
     <addaction name="actionMaxDecode"/>
     <addaction name="separator"/>
     <addaction name="actionUse_multithreaded_FT8_decoder"/>
@@ -5101,6 +5102,17 @@ QPushButton[state=&quot;ok&quot;] {
    </property>
    <property name="text">
     <string>Deep</string>
+   </property>
+  </action>
+  <action name="actionDeeperDecode">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Deeper</string>
+   </property>
+   <property name="toolTip">
+    <string>WSPR only: everything Max does except the noise-blanker sweep, at a fraction of the processing time. Suited to skimmers and multi-band use.</string>
    </property>
   </action>
   <action name="actionMaxDecode">

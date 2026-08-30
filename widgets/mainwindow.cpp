@@ -755,6 +755,7 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
   ui->actionQuickDecode->setActionGroup(DepthGroup);
   ui->actionMediumDecode->setActionGroup(DepthGroup);
   ui->actionDeepestDecode->setActionGroup(DepthGroup);
+  ui->actionDeeperDecode->setActionGroup(DepthGroup);
   ui->actionMaxDecode->setActionGroup(DepthGroup);
 
   QActionGroup* FT8CyclesGroup = new QActionGroup(this);
@@ -1259,6 +1260,7 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
   if((m_ndepth&7)==2) ui->actionMediumDecode->setChecked(true);
   if((m_ndepth&7)==3) ui->actionDeepestDecode->setChecked(true);
   if((m_ndepth&7)==4) ui->actionMaxDecode->setChecked(true);
+  if((m_ndepth&7)==5) ui->actionDeeperDecode->setChecked(true);
   ui->actionInclude_averaging->setChecked(m_ndepth&16);
   ui->actionInclude_correlation->setChecked(m_ndepth&32);
   ui->actionEnable_AP_DXcall->setChecked(m_ndepth&64);
@@ -2533,6 +2535,12 @@ void MainWindow::dataSink(qint64 frames)
       //narrowband interference excision, the wider timing search, fade-weighted
       //retries, a fourth subtraction pass, and sync refinement for every
       //candidate rather than only those already above the gate
+      //Deeper: everything Max enables except the noise-blanker sweep, for
+      //receivers that cannot spend a Max-sized slice of every 2-minute cycle
+      //per band, a multi-band skimmer above all
+      if((m_ndepth&7)==5) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "20"
+                                     << "-X" << "1" << "-A"
+                                     << "-S" << "0,-1" << "-Y" << "4" << "-G" << "-r";
       if((m_ndepth&7)==4) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "20"
                                      << "-n" << "a" << "-X" << "1" << "-A"
                                      << "-S" << "0,-1" << "-Y" << "4" << "-G" << "-r";
@@ -10769,7 +10777,7 @@ void MainWindow::displayWidgets(qint64 n)
     if(i==19) ui->actionQuickDecode->setEnabled(b);
     if(i==19) ui->actionMediumDecode->setEnabled(b);
     if(i==19) ui->actionDeepestDecode->setEnabled(b);
-    if(i==19) ui->actionMaxDecode->setEnabled(b);
+    if(i==19) { ui->actionMaxDecode->setEnabled(b); ui->actionDeeperDecode->setEnabled(b); }
     if(i==20) ui->actionInclude_averaging->setVisible (b);
     if(i==21) ui->actionInclude_correlation->setVisible (b);
     if(i==22) {
@@ -11726,6 +11734,7 @@ void MainWindow::WSPR_config(bool b)
   ui->WSPR_controls_widget->setVisible (b);
   // Max only changes the WSPR decoder, so do not offer it elsewhere
   ui->actionMaxDecode->setVisible (m_mode=="WSPR");
+  ui->actionDeeperDecode->setVisible (m_mode=="WSPR");
   if(m_mode!="WSPR" and (m_ndepth&7)==4) ui->actionDeepestDecode->setChecked (true);
   ui->lh_decodes_title_label->setVisible(!b and ui->cbMenus->isChecked());
   ui->logQSOButton->setVisible(!b);
@@ -11946,6 +11955,11 @@ void MainWindow::on_actionDeepestDecode_toggled (bool checked)
 void MainWindow::on_actionMaxDecode_toggled (bool checked)
 {
   if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 4;
+}
+
+void MainWindow::on_actionDeeperDecode_toggled (bool checked)
+{
+  if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 5;
 }
 
 void MainWindow::on_actionInclude_averaging_toggled (bool checked)
