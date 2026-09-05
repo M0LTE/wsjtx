@@ -1,3 +1,14 @@
+module osdwspr_boxes
+! The pattern boxes boxit fills and fetchit reads back.  These were a COMMON
+! block, but a threadprivate COMMON compiles to a common TLS symbol, which
+! gfortran emits as the .tls_common directive on Windows and the PE assembler
+! does not understand.  Module variables are ordinary definitions, so the same
+! per-thread storage assembles everywhere.  Nothing else changes: the two
+! routines share exactly the arrays they shared before.
+  integer :: indexes(4000,2), fp(0:525000), np(4000)
+!$omp threadprivate(indexes,fp,np)
+end module osdwspr_boxes
+
 subroutine osdwspr(ss,apmask,ndeep,cw,nhardmin,dmin)
 ! 
 use iso_c_binding
@@ -22,6 +33,10 @@ data gg/1,1,0,1,0,1,0,0,1,0,0,0,1,1,0,0,1,0,1,0,0,1,0,1,1,1,0,1,1,0,0,0, &
         0,1,0,0,0,0,0,0,1,0,0,1,1,1,1,0,0,0,1,0,0,1,0,0,1,0,1,1,1,1,1,1/
 
 save first,gen
+! Each worker builds its own copy of the generator matrix once.  Without this the
+! SAVEd state here and the COMMON block in boxit/fetchit are shared, and the
+! decoder cannot be threaded.
+!$omp threadprivate(first,gen)
 
 if( first ) then ! fill the generator matrix
   gen=0
@@ -286,16 +301,15 @@ subroutine nextpat(mi,k,iorder,iflag)
 end subroutine nextpat
 
 subroutine boxit(reset,e2,ntau,npindex,i1,i2)
+  use osdwspr_boxes
   integer*1 e2(1:ntau)
-  integer   indexes(4000,2),fp(0:525000),np(4000)
   logical reset
-  common/boxes/indexes,fp,np
 
   if(reset) then
-    patterns=-1
-    fp=-1
+! fp is indexed by an ntau-bit pattern, so only the first 2**ntau entries are
+! ever used.  Clearing all 525001 of them moves 2 MB per OSD call for nothing.
+    fp(0:ishft(1,ntau)-1)=-1
     np=-1
-    sc=-1
     indexes=-1
     reset=.false.
   endif
@@ -322,12 +336,12 @@ subroutine boxit(reset,e2,ntau,npindex,i1,i2)
 end subroutine boxit
 
 subroutine fetchit(reset,e2,ntau,i1,i2)
-  integer   indexes(4000,2),fp(0:525000),np(4000)
+  use osdwspr_boxes
   integer   lastpat
   integer*1 e2(ntau)
   logical reset
-  common/boxes/indexes,fp,np
   save lastpat,inext
+!$omp threadprivate(lastpat,inext)
 
   if(reset) then
     lastpat=-1

@@ -1494,6 +1494,23 @@ endif()
 target_include_directories (wsprd PRIVATE ${FFTW3_INCLUDE_DIRS})
 target_link_libraries (wsprd ${FFTW3_LIBRARIES} ${LIBM_LIBRARIES})
 
+# wsprd runs its candidate search and its demodulator trial grid in parallel.
+# osdwspr.f90 additionally needs -frecursive so that its local arrays are
+# per-thread rather than static.
+if (${OPENMP_FOUND})
+  if (OpenMP_C_FLAGS)
+    set_target_properties (wsprd
+      PROPERTIES
+      COMPILE_FLAGS "${OpenMP_C_FLAGS}"
+      LINK_FLAGS "${OpenMP_C_FLAGS}"
+      )
+  endif ()
+  target_compile_options (wsprd
+    PRIVATE
+    $<$<COMPILE_LANGUAGE:Fortran>:-frecursive>   # assumes GNU style Fortran compiler
+    )
+endif ()
+
 # Tell CMake to run moc when necessary
 set (CMAKE_AUTOMOC ON)
 include_directories (${CMAKE_CURRENT_BINARY_DIR})

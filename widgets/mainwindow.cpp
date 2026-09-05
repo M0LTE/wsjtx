@@ -755,6 +755,8 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
   ui->actionQuickDecode->setActionGroup(DepthGroup);
   ui->actionMediumDecode->setActionGroup(DepthGroup);
   ui->actionDeepestDecode->setActionGroup(DepthGroup);
+  ui->actionDeeperDecode->setActionGroup(DepthGroup);
+  ui->actionMaxDecode->setActionGroup(DepthGroup);
 
   QActionGroup* FT8CyclesGroup = new QActionGroup(this);
   ui->actionDecFT8cycles1->setActionGroup(FT8CyclesGroup);
@@ -1257,6 +1259,8 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
   if((m_ndepth&7)==1) ui->actionQuickDecode->setChecked(true);
   if((m_ndepth&7)==2) ui->actionMediumDecode->setChecked(true);
   if((m_ndepth&7)==3) ui->actionDeepestDecode->setChecked(true);
+  if((m_ndepth&7)==4) ui->actionMaxDecode->setChecked(true);
+  if((m_ndepth&7)==5) ui->actionDeeperDecode->setChecked(true);
   ui->actionInclude_averaging->setChecked(m_ndepth&16);
   ui->actionInclude_correlation->setChecked(m_ndepth&32);
   ui->actionEnable_AP_DXcall->setChecked(m_ndepth&64);
@@ -2525,9 +2529,21 @@ void MainWindow::dataSink(qint64 frames)
       t2 << "-f" << QString {"%1"}.arg (m_dialFreqRxWSPR / 1e6, 0, 'f', 6);
       if((m_ndepth&7)==1) depth_args << "-qB"; //2 pass w subtract, no Block detection, no shift jittering
       if((m_ndepth&7)==2) depth_args << "-C" << "500" << "-o" << "4"; //3 pass, subtract, Block detection, OSD
-      if((m_ndepth&7)==3) depth_args << "-C" << "500"  << "-o" << "4" << "-d"; //3 pass, subtract, Block detect, OSD, more candidates
-      QStringList degrade;
-      degrade << "-d" << QString {"%1"}.arg (m_config.degrade(), 4, 'f', 1);
+      //3 pass, subtract, Block detect, OSD, more candidates
+      if((m_ndepth&7)==3) depth_args << "-C" << "500"  << "-o" << "4" << "-d";
+      //Max: as Deep, plus coherent demodulation, the auto noise blanker,
+      //narrowband interference excision, the wider timing search, fade-weighted
+      //retries, a fourth subtraction pass, and sync refinement for every
+      //candidate rather than only those already above the gate
+      //Deeper: everything Max enables except the noise-blanker sweep, for
+      //receivers that cannot spend a Max-sized slice of every 2-minute cycle
+      //per band, a multi-band skimmer above all
+      if((m_ndepth&7)==5) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "20"
+                                     << "-X" << "1" << "-A"
+                                     << "-S" << "0,-1" << "-Y" << "4" << "-G" << "-r";
+      if((m_ndepth&7)==4) depth_args << "-C" << "500"  << "-o" << "4" << "-d" << "-N" << "20"
+                                     << "-n" << "a" << "-X" << "1" << "-A"
+                                     << "-S" << "0,-1" << "-Y" << "4" << "-G" << "-r";
       m_cmndP1.clear ();
       if(m_diskData) {
         m_cmndP1 << depth_args << "-a"
@@ -10761,6 +10777,7 @@ void MainWindow::displayWidgets(qint64 n)
     if(i==19) ui->actionQuickDecode->setEnabled(b);
     if(i==19) ui->actionMediumDecode->setEnabled(b);
     if(i==19) ui->actionDeepestDecode->setEnabled(b);
+    if(i==19) { ui->actionMaxDecode->setEnabled(b); ui->actionDeeperDecode->setEnabled(b); }
     if(i==20) ui->actionInclude_averaging->setVisible (b);
     if(i==21) ui->actionInclude_correlation->setVisible (b);
     if(i==22) {
@@ -11715,6 +11732,10 @@ void MainWindow::WSPR_config(bool b)
   ui->QSO_controls_widget->setVisible (!b);
   ui->DX_controls_widget->setVisible (!b or (m_mode=="Echo"));
   ui->WSPR_controls_widget->setVisible (b);
+  // Max only changes the WSPR decoder, so do not offer it elsewhere
+  ui->actionMaxDecode->setVisible (m_mode=="WSPR");
+  ui->actionDeeperDecode->setVisible (m_mode=="WSPR");
+  if(m_mode!="WSPR" and (m_ndepth&7)==4) ui->actionDeepestDecode->setChecked (true);
   ui->lh_decodes_title_label->setVisible(!b and ui->cbMenus->isChecked());
   ui->logQSOButton->setVisible(!b);
   ui->DecodeButton->setEnabled(!b);
@@ -11911,19 +11932,34 @@ void MainWindow::on_actionUse_multithreaded_FT8_decoder_triggered(bool checked)
 }
 //ft8md
 
+// The depth lives in the low three bits of m_ndepth.  Set them outright rather
+// than or-ing a mask in: with four modes, leaving a higher bit set from a
+// previous choice would produce a value matching no mode at all.  Acting only
+// on the checked signal is well defined however the exclusive action group
+// orders its toggles.
 void MainWindow::on_actionQuickDecode_toggled (bool checked)
 {
-  m_ndepth ^= (-checked ^ m_ndepth) & 0x00000001;
+  if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 1;
 }
 
 void MainWindow::on_actionMediumDecode_toggled (bool checked)
 {
-  m_ndepth ^= (-checked ^ m_ndepth) & 0x00000002;
+  if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 2;
 }
 
 void MainWindow::on_actionDeepestDecode_toggled (bool checked)
 {
-  m_ndepth ^= (-checked ^ m_ndepth) & 0x00000003;
+  if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 3;
+}
+
+void MainWindow::on_actionMaxDecode_toggled (bool checked)
+{
+  if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 4;
+}
+
+void MainWindow::on_actionDeeperDecode_toggled (bool checked)
+{
+  if (checked) m_ndepth = (m_ndepth & ~0x00000007) | 5;
 }
 
 void MainWindow::on_actionInclude_averaging_toggled (bool checked)
